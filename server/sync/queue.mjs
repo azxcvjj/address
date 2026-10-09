@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { loadSourceCatalog, sourceAdapterRevisions, sourceCapabilityRevision } from './source-adapters.mjs';
 import { evaluateCountryGoals } from './country-goals.mjs';
+import { CHINA_PRIORITY_TARGET } from './address-policy.mjs';
 import { ADDRESS_IMPORT_REVISION } from './postgres-address-importer.mjs';
 import { createCredentialBrokerClient } from '../credential-broker/client.mjs';
 
@@ -34,7 +35,9 @@ const executionCapabilityRevisions = Object.freeze({
 // successfully checked sources remain terminal.
 const adapterExecutionCapabilityRevisions = Object.freeze({
   'japan-abr': { materialize: 'japan-abr-materialize-v4' },
-  'korea-kapt': { materialize: 'korea-kapt-bridge-v3' }
+  'korea-kapt': { materialize: 'korea-kapt-bridge-v3' },
+  'google-residential-enrichment': { discover: 'google-checkpoint-discovery-v5-legacy-raw-url' },
+  geofabrik: { discover: 'geofabrik-redirect-resolver-v3-dated-probe' }
 });
 // Countries whose synchronization consumes a metered provider quota. A shard
 // may declare `quotaProvider` in source-shards.json to extend this; the
@@ -66,6 +69,8 @@ const integer = (value, fallback, minimum, maximum) => {
   const parsed = Number.parseInt(String(value ?? ''), 10);
   return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
 };
+const queueStateError = (message, cause) => Object.assign(new Error(message, { cause }), { code: 'QUEUE_STATE_INVALID' });
+const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
 // Mirrors nextQuotaReset in server/control/store.ts (read-only reference).
 export const nextQuotaResetTime = (period, offsetMinutes, date = new Date()) => {
@@ -254,7 +259,8 @@ export const evaluateAttempt = ({
   partialWorkCount = 0,
   partialMinimumWorkCount = 1,
   partialProgressEvaluationReady = false,
-  maxPartialStalls = 3
+  maxPartialStalls = 3,
+  growthCapped = false
 }) => {
   const progressed = netGrowth > 0 || (goalDeficitBefore != null && goalDeficitAfter != null
     && Number(goalDeficitAfter) < Number(goalDeficitBefore));
@@ -319,12 +325,13 @@ export const evaluateAttempt = ({
     };
   }
   if (jobSucceeded && progressed) {
+    // A run stopped only by its per-run growth step continues shortly instead of waiting a full interval.
     return {
       action: 'checked',
       reason: CHECKED_REASON,
       fingerprint: fingerprintAfter,
       consecutiveFailures: 0,
-      nextAttemptAt: new Date(timestamp(completedAt) + Math.max(60_000, probeIntervalMs)).toISOString()
+      nextAttemptAt: new Date(timestamp(completedAt) + (growthCapped ? 60_000 : Math.max(60_000, probeIntervalMs))).toISOString()
     };
   }
   if (jobSucceeded || deterministicFailure) {
@@ -388,19 +395,32 @@ export class QueueStateStore {
   }
 
   async load() {
+    let value;
     try {
-      const state = JSON.parse(await readFile(this.file, 'utf8'));
-      return state?.schemaVersion === 1 && state.countries ? state : { schemaVersion: 1, countries: {} };
-    } catch {
-      return { schemaVersion: 1, countries: {} };
+      value = await readFile(this.file, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { schemaVersion: 1, countries: {} };
+      throw queueStateError(`Unable to read queue state: ${this.file}`, error);
     }
+    let state;
+    try { state = JSON.parse(value); }
+    catch (error) { throw queueStateError(`Queue state is not valid JSON: ${this.file}`, error); }
+    if (state?.schemaVersion !== 1 || !isRecord(state.countries)) {
+      throw queueStateError(`Queue state has an unsupported structure: ${this.file}`);
+    }
+    return state;
   }
 
   async save(state) {
     await mkdir(dirname(this.file), { recursive: true });
     const temporary = `${this.file}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
-    await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-    await rename(temporary, this.file);
+    try {
+      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+      await rename(temporary, this.file);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   async apply(countryCode, evaluation, evaluatedAt, shardId = null) {
@@ -530,14 +550,19 @@ export class PostgresQueueStateStore {
     let legacy;
     try {
       legacy = JSON.parse(await readFile(this.legacyFile, 'utf8'));
-    } catch {
-      this.initialized = true;
-      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') { this.initialized = true; return; }
+      throw queueStateError(`Legacy queue state is not valid JSON: ${this.legacyFile}`, error);
+    }
+    if ((!legacy?.schemaVersion && !Object.hasOwn(legacy || {}, 'countries'))
+      || (legacy?.schemaVersion !== undefined && legacy.schemaVersion !== 1)
+      || !isRecord(legacy.countries)) {
+      throw queueStateError(`Legacy queue state has an unsupported structure: ${this.legacyFile}`);
     }
     for (const [countryCode, country] of Object.entries(legacy?.countries || {})) {
       const shards = country?.shards || { [countryCode]: country };
       for (const [sourceId, entry] of Object.entries(shards)) {
-        if (!entry || typeof entry !== 'object') continue;
+        if (!isRecord(entry)) throw queueStateError(`Legacy queue state contains an invalid entry: ${countryCode}/${sourceId}`);
         const existing = await this.database.prepare(`SELECT 1 AS present FROM sync_source_execution_state
           WHERE country_code=? AND source_id=?`).bind(countryCode, sourceId).first('present');
         if (existing) continue;
@@ -692,52 +717,44 @@ export const createQueueSources = ({
       rules[goal.countryCode] = goal.rules;
     }
     const shards = {};
-    try {
-      for (const row of (await database.prepare(
-        'SELECT shard_id,country_code,status,source_version,failure_code,updated_at FROM sync_shard_state'
-      ).all()).results) {
-        (shards[String(row.country_code)] ||= []).push({
-          shardId: String(row.shard_id),
-          status: row.status ? String(row.status) : null,
-          sourceVersion: row.source_version ? String(row.source_version) : '',
-          failureCode: row.failure_code ? String(row.failure_code) : null,
-          updatedAt: row.updated_at ? String(row.updated_at) : ''
-        });
-      }
-    } catch {}
+    for (const row of (await database.prepare(
+      'SELECT shard_id,country_code,status,source_version,failure_code,updated_at FROM sync_shard_state'
+    ).all()).results) {
+      (shards[String(row.country_code)] ||= []).push({
+        shardId: String(row.shard_id),
+        status: row.status ? String(row.status) : null,
+        sourceVersion: row.source_version ? String(row.source_version) : '',
+        failureCode: row.failure_code ? String(row.failure_code) : null,
+        updatedAt: row.updated_at ? String(row.updated_at) : ''
+      });
+    }
     const nodeTargetsUpdatedAt = {};
-    try {
-      for (const row of (await database.prepare(`SELECT country_code,MAX(updated_at) AS updated_at
-        FROM sync_node_overrides GROUP BY country_code`).all()).results) {
-        nodeTargetsUpdatedAt[String(row.country_code)] = String(row.updated_at || '');
-      }
-    } catch {}
+    for (const row of (await database.prepare(`SELECT country_code,MAX(updated_at) AS updated_at
+      FROM sync_node_overrides GROUP BY country_code`).all()).results) {
+      nodeTargetsUpdatedAt[String(row.country_code)] = String(row.updated_at || '');
+    }
     let catalogVersion = '';
-    try {
-      const rows = (await database.prepare(`SELECT source,source_version,source_checksum
-        FROM catalog_metadata ORDER BY source`).all()).results;
-      catalogVersion = rows.map((row) => [String(row.source), String(row.source_version || ''), String(row.source_checksum || '')])
-        .map((row) => row.join(':')).join('|');
-    } catch {}
+    const catalogRows = (await database.prepare(`SELECT source,source_version,source_checksum
+      FROM catalog_metadata ORDER BY source`).all()).results;
+    catalogVersion = catalogRows.map((row) => [String(row.source), String(row.source_version || ''), String(row.source_checksum || '')])
+      .map((row) => row.join(':')).join('|');
     const durationSamples = { countries: {}, sources: {} };
-    try {
-      const rows = (await database.prepare(`SELECT history.country_code,history.source_id,history.started_at,
-          history.completed_at,run.target_json
-        FROM sync_run_countries history JOIN sync_runs run ON run.id=history.run_id
-        WHERE history.status='succeeded' AND run.status='succeeded' AND history.source_id<>''
-          AND history.started_at IS NOT NULL AND history.completed_at IS NOT NULL
-        ORDER BY history.completed_at DESC LIMIT 1000`).all()).results;
-      for (const row of rows) {
-        let target = {};
-        try { target = JSON.parse(String(row.target_json || '{}')); } catch {}
-        const shards = Array.isArray(target.shards) ? target.shards.map(String) : [];
-        if (shards.length !== 1 || shards[0].toLowerCase() === 'all' || shards[0] !== String(row.source_id)) continue;
-        const duration = timestamp(row.completed_at) - timestamp(row.started_at);
-        if (duration <= 0) continue;
-        (durationSamples.countries[String(row.country_code)] ||= []).push(duration);
-        (durationSamples.sources[String(row.source_id)] ||= []).push(duration);
-      }
-    } catch {}
+    const durationRows = (await database.prepare(`SELECT history.country_code,history.source_id,history.started_at,
+        history.completed_at,run.target_json
+      FROM sync_run_countries history JOIN sync_runs run ON run.id=history.run_id
+      WHERE history.status='succeeded' AND run.status='succeeded' AND history.source_id<>''
+        AND history.started_at IS NOT NULL AND history.completed_at IS NOT NULL
+      ORDER BY history.completed_at DESC LIMIT 1000`).all()).results;
+    for (const row of durationRows) {
+      let target = {};
+      try { target = JSON.parse(String(row.target_json || '{}')); } catch {}
+      const shardIds = Array.isArray(target.shards) ? target.shards.map(String) : [];
+      if (shardIds.length !== 1 || shardIds[0].toLowerCase() === 'all' || shardIds[0] !== String(row.source_id)) continue;
+      const duration = timestamp(row.completed_at) - timestamp(row.started_at);
+      if (duration <= 0) continue;
+      (durationSamples.countries[String(row.country_code)] ||= []).push(duration);
+      (durationSamples.sources[String(row.source_id)] ||= []).push(duration);
+    }
     const deficits = { belowTarget: new Set(), belowFloor: new Set() };
     for (const goal of goals.values()) {
       if (goal.countryCode === 'CN' || !goal.enabled) continue;
@@ -874,7 +891,9 @@ export const createQueueSources = ({
     blocksQueue: false, executionState: null, nextAttemptAt: null
   }, async (database) => {
     const goal = (await evaluateCountryGoals(database)).get('CN');
-    if (!goal?.enabled || goal.complete) return { blocksQueue: false, executionState: 'ready', nextAttemptAt: null };
+    // Beyond its original volume goal China rotates with other countries instead of holding the queue.
+    const priorityComplete = goal?.coverageMet && goal.overrideMet && goal.current >= CHINA_PRIORITY_TARGET;
+    if (!goal?.enabled || goal.complete || priorityComplete) return { blocksQueue: false, executionState: 'ready', nextAttemptAt: null };
     const runtime = await database.prepare(`SELECT execution_state,next_attempt_at
       FROM sync_country_runtime WHERE country_code='CN'`).first();
     if (!runtime) return { blocksQueue: false, executionState: 'uninitialized', nextAttemptAt: null };
@@ -889,7 +908,15 @@ export const createQueueSources = ({
     };
   });
 
-  return { addressFacts, quotaStatus, chinaPriority };
+  // Active rows still waiting for translation or publication; permanently rejected rows do not count.
+  const unpublishedBacklog = (countryCode) => withDatabase(addressDatabase, 0, async (database) => Number(
+    await database.prepare(`SELECT COUNT(*) AS total FROM address_pool pool
+      LEFT JOIN address_generation_index generation ON generation.address_id=pool.id AND generation.active=1
+      LEFT JOIN translation_recovery recovery ON recovery.address_id=pool.id AND recovery.status IN ('failed','rejected')
+      WHERE pool.country_code=? AND pool.active=1 AND generation.address_id IS NULL AND recovery.address_id IS NULL`).bind(countryCode).first('total')
+  ) || 0);
+
+  return { addressFacts, quotaStatus, chinaPriority, unpublishedBacklog };
 };
 
 const runningJobCountries = (job, shards) => {
@@ -1241,8 +1268,12 @@ export const createSyncQueue = ({
   cooldownMs = integer(environment.SYNC_QUEUE_COOLDOWN_MS, 10_000, 0, 60 * 60_000),
   backoffBaseMs = integer(environment.SYNC_QUEUE_BACKOFF_BASE_MS, 5 * 60_000, 1_000, 24 * 60 * 60_000),
   backoffCapMs = integer(environment.SYNC_QUEUE_BACKOFF_CAP_MS, 6 * 60 * 60_000, 60_000, 7 * 24 * 60 * 60_000),
-  enableSourceProbes = environment.ADDRESS_SYNC_ENABLE_SOURCE_PROBES === 'true'
+  enableSourceProbes = environment.ADDRESS_SYNC_ENABLE_SOURCE_PROBES === 'true',
+  maxUnpublishedBacklog = integer(environment.SYNC_QUEUE_MAX_UNPUBLISHED_BACKLOG, 20_000, 0, 100_000_000),
+  backlogDeferMs = integer(environment.SYNC_QUEUE_BACKLOG_DEFER_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000)
 }) => {
+  // A country whose imported rows still await publication is not imported again until they drain.
+  const backlogDeferredUntil = new Map();
   const legacyStateFile = resolve(stateDir, 'queue-state.json');
   const store = addressDatabase
     ? new PostgresQueueStateStore(addressDatabase, legacyStateFile)
@@ -1287,15 +1318,31 @@ export const createSyncQueue = ({
     if (migrations.length) result = await build();
     return result;
   };
-  const snapshot = async () => {
-    const result = await queueSnapshot();
-    return {
-      ...result,
-      entries: result.entries.map(({
-        sourceFingerprints, failureFingerprints, failureContexts, sourceExecution, probeShardIds, legacyMigration, ...entry
-      }) => entry)
-    };
+  const publicSnapshot = (result) => ({
+    ...result,
+    entries: result.entries.map(({
+      sourceFingerprints, failureFingerprints, failureContexts, sourceExecution, probeShardIds, legacyMigration, ...entry
+    }) => entry)
+  });
+  let cachedSnapshot = null;
+  let published = { body: '', at: 0 };
+  let chinaLogState = '';
+  const remember = async (result) => {
+    const value = publicSnapshot(result);
+    cachedSnapshot = { value, at: now().getTime() };
+    if (!history?.publishQueueSnapshot) return value;
+    const { generatedAt, ...content } = value;
+    const body = JSON.stringify(content);
+    if (body === published.body && cachedSnapshot.at - published.at < 60_000) return value;
+    try {
+      await history.publishQueueSnapshot(JSON.stringify(value), generatedAt);
+      published = { body, at: cachedSnapshot.at };
+    } catch (error) {
+      log.error?.('[sync-queue] snapshot publish failed', error);
+    }
+    return value;
   };
+  const snapshot = async () => remember(await queueSnapshot());
 
   let stopped = true;
   let loop = null;
@@ -1428,6 +1475,7 @@ export const createSyncQueue = ({
           partialNextAttemptAt: recoveredMetrics.nextAttemptAt || null,
           partialStalls: Number(source.consecutiveFailures || 0),
           partialWorkCount: Number(recoveredMetrics.runRequestCount || 0),
+          partialMinimumWorkCount: Number(recoveredMetrics.progressEvaluationMinimum || 1),
           partialProgressEvaluationReady: recoveredMetrics.progressEvaluationReady === true,
           netGrowth: Number(row.net_growth || 0),
           goalDeficitBefore: goalDeficit(parseJson(row.before_goals_json)),
@@ -1506,25 +1554,51 @@ export const createSyncQueue = ({
     await ensureRecoveredSourceStates();
     if (!coordinator.currentJob) await history?.repairInterruptedRuns?.();
     await history?.schedulerHeartbeat(coordinator.currentJob?.id || null);
-    const snap = await queueSnapshot();
-    await Promise.all(snap.entries.filter((entry) => entry.state === 'quota_wait' && entry.runnableShardId)
-      .map((entry) => history?.repairQuotaWait?.({
-        countryCode: entry.countryCode,
-        sourceId: entry.runnableShardId
-      })));
+    const refresh = async () => {
+      const value = await queueSnapshot();
+      await remember(value);
+      await Promise.all(value.entries.filter((entry) => entry.state === 'quota_wait' && entry.runnableShardId)
+        .map((entry) => history?.repairQuotaWait?.({
+          countryCode: entry.countryCode,
+          sourceId: entry.runnableShardId
+        })));
+      return value;
+    };
+    const chinaBlocked = async () => {
+      const china = await sources.chinaPriority?.(now());
+      if (!china?.blocksQueue) { chinaLogState = ''; return false; }
+      if (chinaLogState !== china.executionState) log.log?.(`[sync-queue] CN priority state=${china.executionState}`);
+      chinaLogState = china.executionState;
+      return true;
+    };
+    if (!coordinator.currentJob && await chinaBlocked()) {
+      if (!cachedSnapshot || now().getTime() - cachedSnapshot.at >= 60_000) await refresh();
+      return Math.min(rescanMs, 5_000);
+    }
+    const snap = await refresh();
     if (coordinator.currentJob) {
       await coordinator.waitForIdle();
       await onIdle?.();
       return 0;
     }
     const currentTime = now();
-    const china = await sources.chinaPriority?.(currentTime);
-    if (china?.blocksQueue) {
-      log.log?.(`[sync-queue] CN priority state=${china.executionState}`);
-      return Math.min(rescanMs, 5_000);
+    if (await chinaBlocked()) return Math.min(rescanMs, 5_000);
+    const backlogDeferred = (entry) => (backlogDeferredUntil.get(entry.countryCode) || 0) > currentTime.getTime();
+    let pick;
+    for (const entry of snap.entries) {
+      if (entry.state !== 'queued' || backlogDeferred(entry)
+        || (entry.nextAttemptAt && timestamp(entry.nextAttemptAt) > currentTime.getTime())) continue;
+      if (maxUnpublishedBacklog && entry.countryCode !== 'CN' && sources.unpublishedBacklog) {
+        const backlog = await sources.unpublishedBacklog(entry.countryCode);
+        if (backlog > maxUnpublishedBacklog) {
+          backlogDeferredUntil.set(entry.countryCode, currentTime.getTime() + backlogDeferMs);
+          log.log?.(`[sync-queue] ${entry.countryCode} deferred unpublished=${backlog}`);
+          continue;
+        }
+      }
+      pick = entry;
+      break;
     }
-    const pick = snap.entries.find((entry) => entry.state === 'queued'
-      && (!entry.nextAttemptAt || timestamp(entry.nextAttemptAt) <= currentTime.getTime()));
     const probePick = !pick && probeSource
       ? snap.entries.find((entry) => entry.state !== 'done' && entry.probeShardIds?.length)
       : null;
@@ -1616,6 +1690,8 @@ export const createSyncQueue = ({
       String(outcome?.shardId || outcome?.shardKey || '') === shardId);
     const beforeSource = pick.sourceExecution?.[shardId] || {};
     const afterSource = after?.sourceExecution?.[shardId] || beforeSource;
+    const ownGrowth = Number(sourceOutcome?.netGrowth || 0);
+    const ownChanges = Number(sourceOutcome?.changedCount || 0) > 0;
     const evaluation = evaluateAttempt({
       jobSucceeded: job?.status === 'succeeded',
       sourceComplete: sourceOutcome?.sourceComplete !== false,
@@ -1627,9 +1703,11 @@ export const createSyncQueue = ({
       partialWorkCount: Number(sourceOutcome?.metrics?.runRequestCount || 0),
       partialMinimumWorkCount: Number(sourceOutcome?.metrics?.progressEvaluationMinimum || 1),
       partialProgressEvaluationReady: sourceOutcome?.metrics?.progressEvaluationReady === true,
-      netGrowth: (after?.current ?? pick.current) - pick.current,
-      goalDeficitBefore: goalDeficit(pick.rules),
-      goalDeficitAfter: goalDeficit(after?.rules),
+      growthCapped: sourceOutcome?.metrics?.growthCapped === true,
+      // Only the source's own import counts as progress; totals also move while translations publish other rows.
+      netGrowth: ownGrowth,
+      goalDeficitBefore: ownChanges ? goalDeficit(pick.rules) : null,
+      goalDeficitAfter: ownChanges ? goalDeficit(after?.rules) : null,
       fingerprintBefore: pick.sourceFingerprints[shardId],
       fingerprintAfter: after?.sourceFingerprints?.[shardId] ?? pick.sourceFingerprints[shardId],
       failureFingerprintAfter: failure.fingerprint,
@@ -1654,7 +1732,7 @@ export const createSyncQueue = ({
       entry: pick, evaluation, evaluatedAt: completedAt, sourceId: shardId, runId: result.job.id
     });
     await applySharedFailureCircuit(after || pick, evaluation, completedAt);
-    log.log?.(`[sync-queue] ${pick.countryCode} ${evaluation.action} growth=${(after?.current ?? pick.current) - pick.current}`);
+    log.log?.(`[sync-queue] ${pick.countryCode} ${evaluation.action} growth=${ownGrowth}`);
     return cooldownMs;
   };
 

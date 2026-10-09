@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 CREATE TABLE IF NOT EXISTS provider_credentials (
   id TEXT PRIMARY KEY,
-  provider TEXT NOT NULL CHECK (provider IN ('amap','baidu','tencent','onemap','youdao','geoapify','google-geocoding','mappls')),
+  provider TEXT NOT NULL CHECK (provider IN ('amap','baidu','tencent','onemap','youdao','geoapify','google-geocoding','mappls','deepl','openai-compatible')),
   label TEXT NOT NULL,
   secret_ciphertext TEXT NOT NULL,
   secret_iv TEXT NOT NULL,
@@ -72,6 +72,18 @@ CREATE TABLE IF NOT EXISTS provider_credentials (
   last_failure_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS translation_routes (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL CHECK (provider IN ('openai-compatible','deepl','youdao','google')),
+  credential_id TEXT REFERENCES provider_credentials(id) ON DELETE CASCADE,
+  priority INTEGER NOT NULL DEFAULT 100 CHECK (priority BETWEEN 1 AND 10000),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  prompt TEXT NOT NULL DEFAULT '' CHECK (length(prompt) <= 4000),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (provider, credential_id)
 );
 
 CREATE TABLE IF NOT EXISTS provider_usage_daily (
@@ -197,6 +209,9 @@ CREATE TABLE IF NOT EXISTS sync_scheduler_state (
   updated_at TEXT NOT NULL
 );
 
+ALTER TABLE sync_scheduler_state ADD COLUMN IF NOT EXISTS queue_snapshot_json TEXT;
+ALTER TABLE sync_scheduler_state ADD COLUMN IF NOT EXISTS queue_snapshot_at TEXT;
+
 CREATE TABLE IF NOT EXISTS audit_events (
   id BIGSERIAL PRIMARY KEY,
   actor TEXT NOT NULL,
@@ -216,7 +231,7 @@ CREATE TABLE IF NOT EXISTS credential_broker_requests (
   id BIGSERIAL PRIMARY KEY,
   client_id TEXT NOT NULL CHECK (client_id IN ('production','test')),
   request_id TEXT NOT NULL,
-  provider TEXT NOT NULL CHECK (provider IN ('amap','baidu','tencent','onemap','geoapify','google-geocoding','mappls')),
+  provider TEXT NOT NULL CHECK (provider IN ('amap','baidu','tencent','onemap','geoapify','google-geocoding','mappls','youdao','deepl','openai-compatible')),
   operation TEXT NOT NULL,
   parameters_hash TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('pending','completed','failed','unknown')),
@@ -232,6 +247,7 @@ CREATE TABLE IF NOT EXISTS credential_broker_dispatches (
   id BIGSERIAL PRIMARY KEY,
   request_key BIGINT NOT NULL REFERENCES credential_broker_requests(id) ON DELETE CASCADE,
   credential_id TEXT REFERENCES provider_credentials(id) ON DELETE SET NULL,
+  credential_revision TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL CHECK (status IN ('dispatched','success','rejected','unknown')),
   outcome TEXT,
   reserved_at TEXT NOT NULL,
@@ -253,6 +269,8 @@ CREATE TABLE IF NOT EXISTS credential_broker_quota_counters (
 
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_provider_credentials_pick ON provider_credentials(provider,enabled,status,cooldown_until,last_used_at);
+CREATE INDEX IF NOT EXISTS idx_translation_routes_order ON translation_routes(enabled,priority,id);
+CREATE INDEX IF NOT EXISTS idx_translation_routes_credential ON translation_routes(credential_id);
 CREATE INDEX IF NOT EXISTS idx_provider_quota_windows_credential ON provider_quota_windows(credential_id,enabled,period);
 CREATE INDEX IF NOT EXISTS idx_provider_quota_observations_reset ON provider_quota_observations(reset_at);
 CREATE INDEX IF NOT EXISTS idx_sync_runs_created ON sync_runs(created_at DESC);
@@ -263,14 +281,17 @@ CREATE INDEX IF NOT EXISTS idx_credential_broker_requests_status
   ON credential_broker_requests(status,updated_at);
 CREATE INDEX IF NOT EXISTS idx_credential_broker_dispatches_request
   ON credential_broker_dispatches(request_key,reserved_at);
+CREATE INDEX IF NOT EXISTS idx_credential_broker_dispatches_in_flight
+  ON credential_broker_dispatches(credential_id,status,reserved_at);
+ALTER TABLE provider_credentials ADD COLUMN IF NOT EXISTS max_concurrency INTEGER NOT NULL DEFAULT 1;
 
 ALTER TABLE provider_credentials DROP CONSTRAINT IF EXISTS provider_credentials_provider_check;
 ALTER TABLE provider_credentials ADD CONSTRAINT provider_credentials_provider_check
-  CHECK (provider IN ('amap','baidu','tencent','onemap','youdao','geoapify','google-geocoding','mappls'));
+  CHECK (provider IN ('amap','baidu','tencent','onemap','youdao','geoapify','google-geocoding','mappls','deepl','openai-compatible'));
 
 ALTER TABLE credential_broker_requests DROP CONSTRAINT IF EXISTS credential_broker_requests_provider_check;
 ALTER TABLE credential_broker_requests ADD CONSTRAINT credential_broker_requests_provider_check
-  CHECK (provider IN ('amap','baidu','tencent','onemap','geoapify','google-geocoding','mappls'));
+  CHECK (provider IN ('amap','baidu','tencent','onemap','geoapify','google-geocoding','mappls','youdao','deepl','openai-compatible'));
 
 ALTER TABLE credential_broker_dispatches
   DROP CONSTRAINT IF EXISTS credential_broker_dispatches_credential_id_fkey;
@@ -278,6 +299,7 @@ ALTER TABLE credential_broker_dispatches ALTER COLUMN credential_id DROP NOT NUL
 ALTER TABLE credential_broker_dispatches
   ADD CONSTRAINT credential_broker_dispatches_credential_id_fkey
   FOREIGN KEY (credential_id) REFERENCES provider_credentials(id) ON DELETE SET NULL;
+ALTER TABLE credential_broker_dispatches ADD COLUMN IF NOT EXISTS credential_revision TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE sync_run_countries ADD COLUMN IF NOT EXISTS candidate_count INTEGER;
 ALTER TABLE sync_run_countries ADD COLUMN IF NOT EXISTS accepted_count INTEGER;
@@ -305,6 +327,24 @@ UPDATE provider_credentials SET status='healthy',failure_count=0,cooldown_until=
 WHERE provider='mappls' AND status='needs_review'
   AND NOT EXISTS (SELECT 1 FROM control_migrations WHERE version=19);
 
+UPDATE provider_quota_windows SET limit_count=100000000
+WHERE limit_count=100 AND credential_id IN (SELECT id FROM provider_credentials WHERE provider='onemap')
+  AND NOT EXISTS (SELECT 1 FROM control_migrations WHERE version=25);
+
+UPDATE provider_credentials SET daily_limit=100000000,quota_limit=100000000
+WHERE provider='onemap' AND quota_limit=100
+  AND NOT EXISTS (SELECT 1 FROM control_migrations WHERE version=25);
+
+DELETE FROM provider_quota_windows
+WHERE credential_id IN (SELECT id FROM provider_credentials WHERE provider='google-geocoding')
+  AND service='geocode-v4' AND period='day' AND limit_count=1000
+  AND NOT EXISTS (SELECT 1 FROM control_migrations WHERE version=25);
+
+UPDATE provider_credentials SET qps_limit=5,daily_limit=10000,quota_period='month',quota_limit=10000,
+  quota_timezone_offset=-480
+WHERE provider='google-geocoding' AND quota_period='day' AND quota_limit=1000
+  AND NOT EXISTS (SELECT 1 FROM control_migrations WHERE version=25);
+
 INSERT INTO control_migrations(version,applied_at)
-SELECT version, CURRENT_TIMESTAMP::text FROM generate_series(1, 19) AS version
+SELECT version, CURRENT_TIMESTAMP::text FROM generate_series(1, 26) AS version
 ON CONFLICT (version) DO NOTHING;

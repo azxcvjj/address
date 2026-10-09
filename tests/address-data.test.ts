@@ -77,6 +77,11 @@ describe('address data aggregation', () => {
     });
   });
 
+  it('uses the same published China count as the public status instead of stale coverage state', async () => {
+    const countries = await listAddressData(database, { counts: { total: 3 }, syncState: 'below_target' });
+    expect(countries.find((country) => country.countryCode === 'CN')).toMatchObject({ currentCount: 3, deficit: 17 });
+  });
+
   it('surfaces the queue credential blocker ahead of stale shard failures', async () => {
     const countries = await listAddressData(database, undefined, new Map([['JP', {
       state: 'blocked',
@@ -86,6 +91,19 @@ describe('address data aggregation', () => {
     expect(countries.find((country) => country.countryCode === 'JP')).toMatchObject({
       status: 'blocked',
       lastError: 'missing_api_key:geoapify'
+    });
+  });
+
+  it('explains a queued wait with the queue reason instead of an older shard failure', async () => {
+    const countries = await listAddressData(database, undefined, new Map([['JP', {
+      state: 'quota_wait',
+      reason: 'google-geocoding',
+      nextAttemptAt: '2026-10-01T08:00:00.000Z'
+    }]]));
+    expect(countries.find((country) => country.countryCode === 'JP')).toMatchObject({
+      status: 'quota_wait',
+      lastError: 'google-geocoding',
+      nextAttemptAt: '2026-10-01T08:00:00.000Z'
     });
   });
 

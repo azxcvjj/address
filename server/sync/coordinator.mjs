@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import { resolve } from 'node:path';
 
 class SyncBusyError extends Error {
@@ -66,6 +67,8 @@ export class SyncCoordinator {
     this.processIsAlive = processIsAlive;
     this.currentJob = null;
     this.currentTask = null;
+    this.currentAbort = null;
+    this.shutdownCancelled = false;
     this.recoveredJobs = [];
     this.initialized = false;
   }
@@ -80,7 +83,7 @@ export class SyncCoordinator {
 
   async trigger(trigger = 'manual', { shards = ['all'], sourceFingerprints = {}, sourceInputs = {} } = {}) {
     await this.initialize();
-    if (this.currentJob) return { accepted: false, job: this.currentJob };
+    if (this.currentJob || this.shutdownCancelled) return { accepted: false, job: this.currentJob };
 
     const id = `sync-${this.now().toISOString().replace(/[-:.TZ]/gu, '')}-${this.idFactory()}`;
     const job = {
@@ -126,6 +129,7 @@ export class SyncCoordinator {
 
   async execute(job, lock) {
     const abort = new AbortController();
+    this.currentAbort = abort;
     let timeout;
     let runTask;
     const heartbeat = setInterval(() => {
@@ -201,6 +205,11 @@ export class SyncCoordinator {
             error: errorText(stuck), errorCode: stuck.code, failurePhase
           });
           await this.writeJob(job).catch(() => {});
+          // The restart that follows skips terminal job files, so history must record the failure first.
+          await Promise.race([
+            Promise.resolve(this.history?.completed(job)),
+            new Promise((resolveWait) => setTimeout(resolveWait, this.cancelGraceMs).unref?.())
+          ]).catch((historyError) => console.error('[address-sync] stuck job history persistence failed', historyError));
           try { this.fatal(stuck); } catch {}
           return;
         }
@@ -210,7 +219,7 @@ export class SyncCoordinator {
         phase: 'failed',
         completedAt: this.now().toISOString(),
         error: errorText(error),
-        errorCode: errorCode(error),
+        errorCode: this.shutdownCancelled ? 'SYNC_JOB_INTERRUPTED' : errorCode(error),
         failurePhase,
         actualShards: error?.selectedShards || job.actualShards || job.shards,
         sourceOutcomes: sanitizeOutcomes(error?.reports || job.sourceOutcomes)
@@ -230,6 +239,7 @@ export class SyncCoordinator {
         } finally {
           this.currentJob = null;
           this.currentTask = null;
+          if (this.currentAbort === abort) this.currentAbort = null;
         }
       }
     }
@@ -249,9 +259,13 @@ export class SyncCoordinator {
         try {
           await rename(this.lockFile, staleFile);
           await rm(staleFile, { force: true });
-          return this.acquireLock(jobId, true);
+          const lock = await this.acquireLock(jobId, true);
+          // The stale lock's job died with its process; record it as interrupted instead of leaving it running.
+          await this.reconcileJobs(jobId).catch((error) => console.error('[address-sync] stale job reconciliation failed', error));
+          return lock;
         } catch (renameError) {
           if (renameError?.code === 'ENOENT') return this.acquireLock(jobId, true);
+          throw renameError;
         }
       }
       throw new SyncBusyError(await this.readLockJobId());
@@ -263,6 +277,7 @@ export class SyncCoordinator {
       jobId,
       token: lock.token,
       pid: process.pid,
+      host: hostname(),
       heartbeatAt: this.now().toISOString()
     }));
     await lock.handle.write(value, 0, value.length, 0);
@@ -317,7 +332,9 @@ export class SyncCoordinator {
       if (!lock) return null;
       if (lock.invalid && await this.removeLockFile()) return null;
     }
-    const ownerAlive = lock.pid === process.pid
+    // The sync service is a singleton whose new container starts only after the old one stopped, and process ids
+    // restart in every container, so a lock written on another host belongs to a stopped process.
+    const ownerAlive = lock.pid === process.pid || (lock.host && lock.host !== hostname())
       ? false
       : Number.isSafeInteger(lock.pid) && lock.pid > 0
       ? this.processIsAlive(lock.pid)
@@ -397,6 +414,46 @@ export class SyncCoordinator {
     }))).sort((left, right) => right.modifiedAt - left.modifiedAt);
     if (!jobs.length) return null;
     return JSON.parse(await readFile(jobs[0].file, 'utf8'));
+  }
+
+  async cancelActive() {
+    // Shutdown also refuses jobs a queue pass still in flight would start after this point.
+    this.shutdownCancelled = true;
+    const task = this.currentTask;
+    if (!task || !this.currentAbort) return false;
+    this.currentAbort.abort(Object.assign(new Error('Synchronization cancelled for shutdown'), { code: 'SYNC_JOB_CANCELLED' }));
+    let stopped = false;
+    let graceTimer;
+    await Promise.race([
+      task.then(() => { stopped = true; }, () => { stopped = true; }),
+      new Promise((resolveGrace) => {
+        graceTimer = setTimeout(resolveGrace, this.cancelGraceMs);
+        graceTimer.unref?.();
+      })
+    ]);
+    clearTimeout(graceTimer);
+    if (!stopped) {
+      const error = Object.assign(
+        new Error(`Synchronization worker did not stop within ${this.cancelGraceMs}ms after shutdown cancellation`),
+        { code: 'SYNC_WORKER_STUCK' }
+      );
+      // The process exits next, so the interruption is recorded first; otherwise the run stays "running".
+      const job = this.currentJob;
+      if (job) {
+        Object.assign(job, {
+          status: 'failed', phase: 'failed', completedAt: this.now().toISOString(), error: errorText(error),
+          errorCode: 'SYNC_JOB_INTERRUPTED', failurePhase: job.phase === 'failed' ? job.failurePhase : job.phase
+        });
+        await this.writeJob(job).catch(() => {});
+        await Promise.race([
+          Promise.resolve(this.history?.completed(job)),
+          new Promise((resolveWait) => setTimeout(resolveWait, this.cancelGraceMs).unref?.())
+        ]).catch((historyError) => console.error('[address-sync] interrupted job history persistence failed', historyError));
+      }
+      try { this.fatal(error); } catch {}
+      return false;
+    }
+    return true;
   }
 
   async waitForIdle() {

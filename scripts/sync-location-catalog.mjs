@@ -5,6 +5,9 @@ import { resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { strFromU8, unzipSync } from 'fflate';
 import { hongKongDistricts, hongKongRegions } from '../src/domain/hk-administrative-divisions.mjs';
+import { catalogHierarchyPaths, correctSpanishProvinceParents } from '../server/database/catalog-hierarchy.mjs';
+import { implausibleChineseTranslation } from '../src/domain/address-localization.mjs';
+import { chinaCityNames, chinaCityRegionCode } from '../server/database/china-catalog-corrections.mjs';
 
 const countryCodes = new Set([
   'US', 'CA', 'MX', 'GB', 'DE', 'FR', 'IT', 'ES', 'NL', 'RU', 'JP', 'HK', 'SG', 'TW', 'KR', 'MY',
@@ -59,14 +62,24 @@ const cities = JSON.parse(gunzipSync(await readFile(citiesFile)).toString('utf8'
 const postcodes = JSON.parse(gunzipSync(await readFile(postcodesFile)).toString('utf8'));
 const residentialCoverage = JSON.parse(await readFile(residentialCoverageUrl, 'utf8'));
 const includedState = (state) => countryCodes.has(state.country_code) && (state.country_code !== 'US' || usStateCodes.has(state.iso2));
-const selectedStates = states.filter((state) => includedState(state) && state.country_code !== 'HK');
+const selectedStates = correctSpanishProvinceParents(states.filter((state) => includedState(state) && state.country_code !== 'HK'));
 selectedStates.push(...hongKongRegions.map((region) => ({
   id: region.id, country_code: 'HK', iso2: region.code, name: region.name, native: region.native,
   translations: { 'zh-CN': region.zh }, type: 'region', parent_id: null, latitude: null, longitude: null
 })));
+const regionPaths = catalogHierarchyPaths(selectedStates);
 const stateIds = new Set(selectedStates.map((state) => state.id));
+const chinaStateIds = new Map(selectedStates.filter((state) => state.country_code === 'CN' && !state.parent_id)
+  .map((state) => [state.iso2, state.id]));
+const chinaStateCodes = new Map([...chinaStateIds].map(([code, id]) => [id, code]));
 const selectedCities = cities.filter((city) => city.country_code !== 'HK' && countryCodes.has(city.country_code)
-  && (!city.state_id || stateIds.has(city.state_id)));
+  && (!city.state_id || stateIds.has(city.state_id))).map((city) => {
+  if (city.country_code !== 'CN') return city;
+  const names = chinaCityNames({ name: city.name, native: city.native, zh: city.translations?.['zh-CN'], latitude: city.latitude, longitude: city.longitude });
+  const stateCode = chinaStateCodes.get(city.state_id);
+  return { ...city, native: names.native, translations: { ...city.translations, 'zh-CN': names.zh },
+    state_id: stateCode ? chinaStateIds.get(chinaCityRegionCode(stateCode, city.latitude)) ?? city.state_id : city.state_id };
+});
 const hongKongRegionIds = new Map(hongKongRegions.map((region) => [region.code, region.id]));
 selectedCities.push(...hongKongDistricts.map((district) => ({
   id: district.id, country_code: 'HK', state_id: hongKongRegionIds.get(district.regionCode),
@@ -79,7 +92,6 @@ let selectedPostcodes = postcodes.filter((postcode) => countryCodes.has(postcode
   && (!postcode.city_id || cityIds.has(postcode.city_id)));
 const dr5hnPostcodeCount = selectedPostcodes.length;
 
-const statesById = new Map(selectedStates.map((state) => [state.id, state]));
 const normalize = (value = '') => value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const stateLookup = new Map();
 for (const state of selectedStates) {
@@ -122,17 +134,6 @@ for (const country of geoNamesTargets) {
     geoNamesAdded += 1;
   }
 }
-const pathFor = (state) => {
-  const path = [];
-  const seen = new Set();
-  let current = state;
-  while (current && !seen.has(current.id)) {
-    seen.add(current.id);
-    path.unshift(current.id);
-    current = current.parent_id ? statesById.get(Number(current.parent_id)) : undefined;
-  }
-  return `/${path.join('/')}/`;
-};
 const sql = (value) => value == null ? 'NULL' : typeof value === 'number' ? String(value) : `'${String(value).replaceAll("'", "''")}'`;
 const number = (value) => value == null || value === '' || Number.isNaN(Number(value)) ? null : Number(value);
 const tuples = (records, values) => records.map((record) => `(${values(record).map(sql).join(',')})`).join(',\n');
@@ -154,14 +155,23 @@ CREATE TABLE catalog_regions_staging AS SELECT * FROM catalog_regions WHERE FALS
 CREATE TABLE catalog_cities_staging AS SELECT * FROM catalog_cities WHERE FALSE;
 CREATE TABLE catalog_postcodes_staging AS SELECT * FROM catalog_postcodes WHERE FALSE;
 `);
+// Upstream Chinese names that are literal translations (Bursa → 囊) are corrected or left to translation instead.
+const chineseNameCorrections = new Map([['TR:16', '布尔萨']]);
+const catalogChineseName = (entry) => {
+  const corrected = chineseNameCorrections.get(`${entry.country_code}:${entry.iso2}`);
+  const translated = corrected || entry.translations?.['zh-CN'] || '';
+  const original = entry.native || entry.name;
+  return translated && (corrected || entry.country_code === 'CN' || /\p{Script=Han}/u.test(original)
+    || !implausibleChineseTranslation(original, translated)) ? translated : original;
+};
 writeBatch(stream, 'catalog_regions_staging', ['id', 'country_code', 'code', 'name', 'native_name', 'zh_name', 'type', 'parent_id', 'path', 'latitude', 'longitude'], selectedStates, (state) => [
   state.id, state.country_code, state.iso2 || '', state.name, state.native || state.name,
-  state.translations?.['zh-CN'] || state.native || state.name, state.type || '', state.parent_id ? Number(state.parent_id) : null,
-  pathFor(state), number(state.latitude), number(state.longitude)
+  catalogChineseName(state), state.type || '', state.parent_id ? Number(state.parent_id) : null,
+  regionPaths.get(Number(state.id)), number(state.latitude), number(state.longitude)
 ]);
 writeBatch(stream, 'catalog_cities_staging', ['id', 'country_code', 'region_id', 'name', 'native_name', 'zh_name', 'type', 'population', 'latitude', 'longitude'], selectedCities, (city) => [
   city.id, city.country_code, city.state_id || null, city.name, city.native || city.name,
-  city.translations?.['zh-CN'] || city.native || city.name, city.type || 'city', number(city.population), number(city.latitude), number(city.longitude)
+  catalogChineseName(city), city.type || 'city', number(city.population), number(city.latitude), number(city.longitude)
 ]);
 writeBatch(stream, 'catalog_postcodes_staging', ['id', 'country_code', 'region_id', 'city_id', 'code', 'locality_name', 'latitude', 'longitude'], selectedPostcodes, (postcode) => [
   postcode.id, postcode.country_code, postcode.state_id || null, postcode.city_id || null, postcode.code,
@@ -205,7 +215,7 @@ for (let index = 0; index < residentialCoverage.length; index += 250) {
   const batch = residentialCoverage.slice(index, index + 250);
   stream.write(`INSERT INTO residential_coverage(country_code,region_name,city_name,address_count,last_verified_at,region_id,city_id) VALUES\n${tuples(batch, (record) => [
     record.countryCode, record.region || '', record.city || '', record.addressCount || 1, record.verifiedAt || now, record.regionId || null, record.cityId || null
-  ])}\nON CONFLICT(country_code,region_name,city_name) DO UPDATE SET address_count = GREATEST(residential_coverage.address_count, excluded.address_count), last_verified_at = GREATEST(residential_coverage.last_verified_at, excluded.last_verified_at), region_id = COALESCE(excluded.region_id, residential_coverage.region_id), city_id = COALESCE(excluded.city_id, residential_coverage.city_id);\n`);
+  ])}\nON CONFLICT(country_code,region_name,city_name,identity_key) DO UPDATE SET address_count = GREATEST(residential_coverage.address_count, excluded.address_count), last_verified_at = GREATEST(residential_coverage.last_verified_at, excluded.last_verified_at), region_id = COALESCE(excluded.region_id, residential_coverage.region_id), city_id = COALESCE(excluded.city_id, residential_coverage.city_id);\n`);
 }
 stream.write('COMMIT;\n');
 await new Promise((resolve, reject) => { stream.end(resolve); stream.on('error', reject); });

@@ -18,11 +18,14 @@ import { isCountryCode } from '../../src/domain/countries.ts';
 import { customBlacklistKeywords, replaceCustomBlacklist } from '../lib/custom-blacklist.mjs';
 import { originAllowed, parseAllowedOrigins } from '../lib/origin-policy';
 import {
-  deleteNodePolicy, deleteNodeTarget, getRuntimePolicy, listCountryNodeTargets, listCountryPolicies, listNodePolicies,
-  updateCountryPolicy, updateRuntimePolicy, upsertNodePolicy, upsertNodeTarget
+  deleteNodeTarget, listCountryNodeTargets, listCountryPolicies, updateCountryPolicy, upsertNodeTarget
 } from '../sync/address-policy.mjs';
 import { evaluateCountryGoals } from '../sync/country-goals.mjs';
 import { queryLocationCatalog, type CatalogField } from '../api/repositories/location-catalog';
+import {
+  diagnoseOpenAICompatible, fetchOpenAICompatibleModelCatalog, OPENAI_COMPATIBLE_DIAGNOSTIC_VALUES, resolveOpenAICompatibleBaseUrl, translateOpenAICompatible
+} from '../credential-broker/openai-compatible.mjs';
+import { preservesAddressIdentifiers, preservesAddressNumbers } from '../../src/domain/address-localization.mjs';
 
 const adminCookie = 'address_admin_session';
 const adminCsrfCookie = 'address_admin_csrf';
@@ -90,8 +93,28 @@ const isMapProvider = (provider: CredentialProviderName): provider is ProviderNa
 export const testServiceCredential = async (
   provider: ServiceProviderName,
   secret: string,
-  fetcher: typeof fetch = fetch
+  fetcher: typeof fetch = fetch,
+  options: { prompt?: string } = {}
 ): Promise<{ success: boolean; resultCount: number }> => {
+  if (provider === 'deepl') throw new ProviderRequestError('invalid', 'DEEPL_REQUIRES_BROKER');
+  if (provider === 'openai-compatible') {
+    const values = ['Beijing', 'Block D1-12', '100000'];
+    let translations: string[];
+    try {
+      translations = await translateOpenAICompatible(secret, values, 'en', fetcher, undefined, { prompt: options.prompt });
+    } catch (error) {
+      const cause = error as { outcome?: string; code?: string; retryAt?: string | null };
+      const outcome = ['qps', 'quota', 'auth', 'network', 'invalid'].includes(cause.outcome || '')
+        ? cause.outcome as 'qps' | 'quota' | 'auth' | 'network' | 'invalid' : 'invalid';
+      throw new ProviderRequestError(outcome, String(cause.code || 'OPENAI_COMPATIBLE_TEST_FAILED'),
+        String(cause.code || ''), cause.retryAt || null, outcome === 'quota' ? 'day' : undefined);
+    }
+    if (translations.length !== values.length || translations.some((value, index) =>
+      !preservesAddressNumbers(values[index], value) || !preservesAddressIdentifiers(values[index], value))) {
+      throw new ProviderRequestError('invalid', 'INVALID_RESPONSE');
+    }
+    return { success: true, resultCount: translations.length };
+  }
   if (provider === 'youdao') {
     const credentials = parseYoudaoSecret(secret);
     if (!credentials) throw new ProviderRequestError('invalid', 'INVALID_PROVIDER_CREDENTIAL');
@@ -219,41 +242,58 @@ export const proxyAmapServiceRequest = async (
 };
 
 export const createAdminApi = ({
-  control, china, addressDb, trustProxy = false, triggerCountrySync, warmReadModels = false
+  control, china, addressDb, trustProxy = false, triggerCountrySync, warmReadModels = false, credentialBroker
 }: {
   control: ControlStore; china: ChinaDataService; addressDb: Database; trustProxy?: boolean;
   triggerCountrySync?: (countryCode: string) => Promise<Record<string, unknown>>;
   warmReadModels?: boolean;
+  credentialBroker?: { request: (operation: string, parameters: Record<string, unknown>, options?: Record<string, unknown>) => Promise<unknown> } | null;
 }) => {
   const app = new Hono<{ Bindings: RequestBindings }>();
+  const modelFetchRateLimiter = createAmapProxyRateLimiter(30, 10 * 60_000);
   const wakeChina = async (): Promise<void> => {
     if (typeof china.wake === 'function') await china.wake(0);
   };
-  interface SyncQueueUpstream { generatedAt?: string; job?: unknown; entries?: Array<Record<string, unknown>> }
-  let syncQueueUpstreamSnapshot: { expiresAt: number; promise: Promise<SyncQueueUpstream | null> } | undefined;
-  const loadSyncQueueUpstream = async (): Promise<SyncQueueUpstream | null> => {
-    if (syncQueueUpstreamSnapshot && syncQueueUpstreamSnapshot.expiresAt > Date.now()) {
-      return syncQueueUpstreamSnapshot.promise;
-    }
+  let credentialWake: Promise<void> | undefined;
+  let credentialWakeRequested = false;
+  const notifyCredentialChange = (provider: CredentialProviderName): void => {
+    if (!isMapProvider(provider)) return;
+    credentialWakeRequested = true;
+    credentialWake ||= Promise.resolve().then(async () => {
+      while (credentialWakeRequested) {
+        credentialWakeRequested = false;
+        try { await wakeChina(); }
+        catch { console.error('CHINA_CREDENTIAL_WAKE_FAILED'); }
+      }
+    }).finally(() => { credentialWake = undefined; });
+  };
+  interface SyncQueueUpstream { generatedAt?: string; job?: unknown; entries?: Array<Record<string, unknown>>; stale?: boolean }
+  const syncQueueFreshMs = 3 * 60_000;
+  const fetchSyncQueueUpstream = async (): Promise<SyncQueueUpstream | null> => {
     const syncToken = process.env.SYNC_ADMIN_TOKEN?.trim();
     if (!syncToken) return null;
-    const promise = (async () => {
-      try {
-        const response = await fetch(new URL('/api/v1/sync/queue', process.env.SYNC_CONTROL_URL || 'http://127.0.0.1:8791'), {
-          headers: { Authorization: `Bearer ${syncToken}` }, signal: AbortSignal.timeout(2_000)
-        });
-        return response.ok ? ((await response.json()) as { data?: SyncQueueUpstream }).data || null : null;
-      } catch {
-        return null;
-      }
-    })();
-    syncQueueUpstreamSnapshot = { expiresAt: Number.POSITIVE_INFINITY, promise };
-    void promise.then(() => {
-      if (syncQueueUpstreamSnapshot?.promise === promise) syncQueueUpstreamSnapshot.expiresAt = Date.now() + 2_000;
-    });
-    return promise;
+    try {
+      const response = await fetch(new URL('/api/v1/sync/queue', process.env.SYNC_CONTROL_URL || 'http://127.0.0.1:8791'), {
+        headers: { Authorization: `Bearer ${syncToken}` }, signal: AbortSignal.timeout(5_000)
+      });
+      return response.ok ? ((await response.json()) as { data?: SyncQueueUpstream }).data || null : null;
+    } catch {
+      return null;
+    }
   };
-  const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+  const loadSyncQueueUpstream = async (): Promise<SyncQueueUpstream | null> => {
+    const row = await addressDb.prepare(`SELECT queue_snapshot_json,queue_snapshot_at FROM sync_scheduler_state
+      WHERE scheduler_id='address-sync'`).first<{ queue_snapshot_json: string | null; queue_snapshot_at: string | null }>()
+      .catch(() => null);
+    if (!row?.queue_snapshot_json) return fetchSyncQueueUpstream();
+    try {
+      const value = JSON.parse(row.queue_snapshot_json) as SyncQueueUpstream;
+      const generatedAt = Date.parse(value.generatedAt || row.queue_snapshot_at || '');
+      return { ...value, stale: !Number.isFinite(generatedAt) || Date.now() - generatedAt > syncQueueFreshMs };
+    } catch {
+      return null;
+    }
+  };
   const coverageMaxAgeMs = 5 * 60_000;
   let coverageRefresh: Promise<void> | undefined;
   const startCoverageRefresh = (): Promise<void> => {
@@ -294,6 +334,11 @@ export const createAdminApi = ({
   type AddressDataValue = Awaited<ReturnType<typeof listAddressData>>;
   let addressDataValue: AddressDataValue | undefined;
   let syncQueueValue: Record<string, unknown> | undefined;
+  // A stale read model is served while it refreshes only if it is recent; after a quiet period the caller waits,
+  // so counts never come from hours ago.
+  const STALE_READ_MODEL_MS = 120_000;
+  let addressDataValueAt = 0;
+  let syncQueueValueAt = 0;
   let addressDataSnapshot: { expiresAt: number; promise: Promise<AddressDataValue> } | undefined;
   let syncQueueSnapshot: { expiresAt: number; promise: Promise<Record<string, unknown>> } | undefined;
   const invalidateAdminReadModels = (): void => {
@@ -301,7 +346,6 @@ export const createAdminApi = ({
     syncQueueValue = undefined;
     addressDataSnapshot = undefined;
     syncQueueSnapshot = undefined;
-    syncQueueUpstreamSnapshot = undefined;
   };
   const loadAddressDataSnapshot = (): ReturnType<typeof listAddressData> => {
     if (addressDataSnapshot && addressDataSnapshot.expiresAt > Date.now()) return addressDataSnapshot.promise;
@@ -319,11 +363,12 @@ export const createAdminApi = ({
     addressDataSnapshot = { expiresAt: Number.POSITIVE_INFINITY, promise };
     void promise.then((value) => {
       addressDataValue = value;
+      addressDataValueAt = Date.now();
       if (addressDataSnapshot?.promise === promise) addressDataSnapshot.expiresAt = Date.now() + 10_000;
     }, () => {
       if (addressDataSnapshot?.promise === promise) addressDataSnapshot = undefined;
     });
-    return stale === undefined ? promise : Promise.resolve(stale);
+    return stale === undefined || Date.now() - addressDataValueAt > STALE_READ_MODEL_MS ? promise : Promise.resolve(stale);
   };
   const loadSyncQueueSnapshot = (): Promise<Record<string, unknown>> => {
     if (syncQueueSnapshot && syncQueueSnapshot.expiresAt > Date.now()) return syncQueueSnapshot.promise;
@@ -391,8 +436,8 @@ export const createAdminApi = ({
       let position = 0;
       for (const entry of entries) if (entry.state === 'queued') entry.position = ++position;
       return {
-        available: Boolean(upstream),
-        generatedAt: upstream?.generatedAt || new Date().toISOString(),
+        available: Boolean(upstream && !upstream.stale),
+        generatedAt: upstream?.generatedAt || null,
         job: upstream?.job ?? null,
         entries
       };
@@ -400,11 +445,13 @@ export const createAdminApi = ({
     syncQueueSnapshot = { expiresAt: Number.POSITIVE_INFINITY, promise };
     void promise.then((value) => {
       syncQueueValue = value;
+      syncQueueValueAt = Date.now();
       if (syncQueueSnapshot?.promise === promise) syncQueueSnapshot.expiresAt = Date.now() + 10_000;
     }, () => {
       if (syncQueueSnapshot?.promise === promise) syncQueueSnapshot = undefined;
     });
-    return stale === undefined ? promise : Promise.resolve(stale);
+    return stale === undefined || !stale.available || Date.now() - syncQueueValueAt > STALE_READ_MODEL_MS
+      ? promise : Promise.resolve(stale);
   };
 
   if (warmReadModels) queueMicrotask(() => {
@@ -438,15 +485,13 @@ export const createAdminApi = ({
   app.get('/admin/api/status', async (context) => context.json({ data: await control.status() }));
   app.post('/admin/api/login', async (context) => {
     const ip = requestClientAddress(context.req.raw, context.env?.remoteAddress, trustProxy);
-    if (loginAttempts.size > 5000) loginAttempts.clear();
-    const attempt = loginAttempts.get(ip);
-    if (attempt && attempt.resetAt > Date.now() && attempt.count >= 8) return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429);
+    if (await control.loginBlocked(ip)) return context.json({ error: 'LOGIN_RATE_LIMITED' }, 429);
     const input = await context.req.json<{ password?: string }>().catch((): { password?: string } => ({}));
     if (!await control.verifyIdentity('admin', String(input.password || ''))) {
-      loginAttempts.set(ip, { count: attempt?.resetAt && attempt.resetAt > Date.now() ? attempt.count + 1 : 1, resetAt: Date.now() + 15 * 60000 });
+      await control.recordLoginFailure(ip);
       return context.json({ error: 'INVALID_CREDENTIALS' }, 401);
     }
-    loginAttempts.delete(ip);
+    await control.clearLoginFailures(ip);
     const session = await control.createSession('admin', ip);
     const status = await control.status();
     setCookie(context, adminCookie, session.token, { ...secureCookie, maxAge: 12 * 60 * 60 });
@@ -476,38 +521,46 @@ export const createAdminApi = ({
     } });
   });
 
-  app.get('/admin/api/dashboard', async (context) => {
-    const [addressCount, chinaStatus, credentials, runs, addressBytes, controlBytes] = await Promise.all([
-      addressDb.prepare('SELECT COUNT(*) AS total FROM address_pool WHERE active=1').first<number>('total'),
-      china.status(), control.listCredentials(), control.runs(10),
-      addressDb.prepare(`SELECT COALESCE(SUM(pg_total_relation_size((schemaname||'.'||tablename)::regclass)),0) AS total
-        FROM pg_tables WHERE schemaname='address'`).first<number>('total'),
-      addressDb.prepare(`SELECT COALESCE(SUM(pg_total_relation_size((schemaname||'.'||tablename)::regclass)),0) AS total
-        FROM pg_tables WHERE schemaname='control'`).first<number>('total')
+  const dayStart = (value: string | undefined): string => {
+    const parsed = Date.parse(value || '');
+    const now = Date.now();
+    if (Number.isFinite(parsed) && parsed <= now && now - parsed <= 48 * 60 * 60_000) return new Date(parsed).toISOString();
+    const today = new Date();
+    return new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate())).toISOString();
+  };
+  const systemStatus = async (since: string) => {
+    const [growth, lastUpdatedAt, scheduler, databaseBytes, apiRequestsToday] = await Promise.all([
+      addressDb.prepare(`SELECT COALESCE(SUM(net_growth),0) AS total FROM sync_run_countries
+        WHERE net_growth IS NOT NULL AND completed_at>=?`).bind(since).first<number>('total').catch(() => null),
+      addressDb.prepare(`SELECT MAX(completed_at) AS updated_at FROM sync_run_countries
+        WHERE net_growth IS NOT NULL AND net_growth<>0`).first<string>('updated_at').catch(() => null),
+      addressDb.prepare(`SELECT heartbeat_at FROM sync_scheduler_state WHERE scheduler_id='address-sync'`)
+        .first<string>('heartbeat_at').catch(() => null),
+      addressDb.prepare('SELECT pg_database_size(current_database()) AS total').first<number>('total').catch(() => null),
+      control.providerRequestsToday().catch(() => null)
     ]);
-    return context.json({ data: {
-      addressCount: Number(addressCount || 0), china: chinaStatus, credentials, runs,
-      storage: { addressBytes: Number(addressBytes || 0), controlBytes: Number(controlBytes || 0) }
-    } });
-  });
-  app.get('/admin/api/dashboard/coverage', async (context) => {
-    const parent = String(context.req.query('parent') || '');
-    if (parent.length > 512) return context.json({ error: 'INVALID_COVERAGE_PARENT' }, 400);
-    await ensureCoverage(context.req.query('refresh') === 'true');
-    return context.json({ data: await listAddressCoverage(addressDb, parent) });
-  });
+    const heartbeat = Date.parse(String(scheduler || ''));
+    const databaseHealthy = databaseBytes !== null;
+    const schedulerHealthy = Number.isFinite(heartbeat) && Date.now() - heartbeat <= 3 * 60_000;
+    return {
+      todayGrowth: Number(growth || 0),
+      apiRequestsToday: Number(apiRequestsToday || 0),
+      databaseBytes: Number(databaseBytes || 0),
+      lastUpdatedAt: lastUpdatedAt || null,
+      schedulerHeartbeatAt: scheduler || null,
+      databaseHealthy,
+      schedulerHealthy,
+      serviceHealthy: databaseHealthy && schedulerHealthy
+    };
+  };
+  app.get('/admin/api/system/status', async (context) => context.json({ data: await systemStatus(dayStart(context.req.query('since'))) }));
   app.get('/admin/api/dashboard/overview', async (context) => {
     const parent = String(context.req.query('parent') || '');
     if (parent.length > 512) return context.json({ error: 'INVALID_COVERAGE_PARENT' }, 400);
     await ensureCoverage(context.req.query('refresh') === 'true');
-    const [nodes, todayUpdates, lastUpdatedAt, apiRequestsToday, databaseBytes] = await Promise.all([
+    const [nodes, status] = await Promise.all([
       listAddressCoverage(addressDb, parent),
-      addressDb.prepare(`SELECT COALESCE(SUM(active_count),0) AS total FROM address_datasets
-        WHERE status='active' AND CAST(SUBSTR(imported_at,1,10) AS date)=CURRENT_DATE`).first<number>('total'),
-      addressDb.prepare(`SELECT MAX(last_success_at) AS updated_at FROM sync_country_state
-        WHERE status='ready'`).first<string>('updated_at'),
-      control.providerRequestsToday(),
-      addressDb.prepare('SELECT pg_database_size(current_database()) AS total').first<number>('total')
+      systemStatus(dayStart(context.req.query('since')))
     ]);
     const countryNodes = parent ? await listAddressCoverage(addressDb) : nodes.filter((node) => node.level === 0);
     const lowestLevels = countryNodes.map((node) => node.coverageLevels?.at(-1)).filter(Boolean);
@@ -517,31 +570,15 @@ export const createAdminApi = ({
       nodes,
       countries: countryNodes,
       metrics: {
+        ...status,
         countryCount: countryNodes.length,
+        addressTotal: countryNodes.reduce((total, node) => total + node.totalCount, 0),
         residentialTotal: countryNodes.reduce((total, node) => total + node.residentialCount, 0),
         coveredLowest,
         totalLowest,
-        coverageRate: totalLowest ? coveredLowest / totalLowest : 0,
-        todayUpdates: Number(todayUpdates || 0),
-        apiRequestsToday,
-        databaseBytes: Number(databaseBytes || 0),
-        lastUpdatedAt: lastUpdatedAt || null,
-        serviceHealthy: true
+        coverageRate: totalLowest ? coveredLowest / totalLowest : 0
       }
     } });
-  });
-
-  app.get('/admin/api/sync/policies', async (context) => {
-    await ensureCoverage();
-    const [runtime, countries] = await Promise.all([getRuntimePolicy(addressDb), listCountryPolicies(addressDb)]);
-    return context.json({ data: { runtime, countries } });
-  });
-  app.put('/admin/api/sync/policies/runtime', async (context) => {
-    const value = await updateRuntimePolicy(addressDb, await context.req.json<Record<string, unknown>>());
-    await control.audit('admin', 'sync_policy.runtime.update', 'global', {
-      prepareConcurrency: value.prepareConcurrency, cpuConcurrency: value.cpuConcurrency
-    });
-    return context.json({ data: value });
   });
   app.put('/admin/api/sync/policies/countries/:country', async (context) => {
     const countryCode = context.req.param('country').toUpperCase();
@@ -558,28 +595,6 @@ export const createAdminApi = ({
       }
     }
     return context.json({ data: { ...value, sync } });
-  });
-  app.get('/admin/api/sync/policies/nodes', async (context) => {
-    const parent = String(context.req.query('parent') || '');
-    if (parent.length > 512) return context.json({ error: 'INVALID_POLICY_PARENT' }, 400);
-    await ensureCoverage();
-    return context.json({ data: await listNodePolicies(addressDb, parent) });
-  });
-  app.put('/admin/api/sync/policies/nodes', async (context) => {
-    const input = await context.req.json<{ key?: string; targetCount?: number }>();
-    if (!input.key || input.key.length > 512) return context.json({ error: 'INVALID_POLICY_NODE' }, 400);
-    const value = await upsertNodePolicy(addressDb, input.key, input.targetCount);
-    invalidateAdminReadModels();
-    await control.audit('admin', 'sync_policy.node.update', input.key, { targetCount: input.targetCount });
-    return context.json({ data: value });
-  });
-  app.delete('/admin/api/sync/policies/nodes', async (context) => {
-    const key = String(context.req.query('key') || '');
-    if (!key || key.length > 512) return context.json({ error: 'INVALID_POLICY_NODE' }, 400);
-    await deleteNodePolicy(addressDb, key);
-    invalidateAdminReadModels();
-    await control.audit('admin', 'sync_policy.node.delete', key);
-    return context.json({ data: { success: true } });
   });
   app.get('/admin/api/sync/policies/countries/:country/nodes', async (context) => {
     await ensureCoverage();
@@ -654,7 +669,7 @@ export const createAdminApi = ({
       country,
       field,
       query,
-      residential: true,
+      residential: country === 'CN',
       cursor: context.req.query('cursor') || undefined,
       limit: 100
     });
@@ -689,14 +704,41 @@ export const createAdminApi = ({
   });
 
   app.get('/admin/api/settings/translation', async (context) => context.json({ data: {
-    googleTranslationEnabled: Boolean(await control.setting('google_translation_enabled', true))
+    googleTranslationEnabled: Boolean(await control.setting('google_translation_enabled', true)),
+    googleTranslationConcurrency: Number(await control.setting('google_translation_concurrency', 1)),
+    routes: await control.translationRoutes()
   } }));
   app.put('/admin/api/settings/translation', async (context) => {
-    const input = await context.req.json<{ googleTranslationEnabled?: unknown }>();
-    if (typeof input.googleTranslationEnabled !== 'boolean') return context.json({ error: 'INVALID_TRANSLATION_CONFIG' }, 400);
-    await control.setSetting('google_translation_enabled', input.googleTranslationEnabled);
-    await control.audit('admin', 'settings.translation.update', 'translation', { googleTranslationEnabled: input.googleTranslationEnabled });
-    return context.json({ data: { googleTranslationEnabled: input.googleTranslationEnabled } });
+    const input = await context.req.json<{ googleTranslationEnabled?: unknown; googleTranslationConcurrency?: unknown }>();
+    const hasEnabled = input.googleTranslationEnabled !== undefined;
+    const hasConcurrency = input.googleTranslationConcurrency !== undefined;
+    if ((!hasEnabled && !hasConcurrency) || (hasEnabled && typeof input.googleTranslationEnabled !== 'boolean')
+      || (hasConcurrency && !(Number.isInteger(input.googleTranslationConcurrency)
+        && Number(input.googleTranslationConcurrency) >= 1 && Number(input.googleTranslationConcurrency) <= 50))) {
+      return context.json({ error: 'INVALID_TRANSLATION_CONFIG' }, 400);
+    }
+    if (hasEnabled) {
+      const googleRoute = (await control.translationRoutes()).find((route) => route.provider === 'google');
+      if (googleRoute) await control.updateTranslationRoutes([{ id: googleRoute.id, priority: googleRoute.priority, enabled: Boolean(input.googleTranslationEnabled) }]);
+      await control.setSetting('google_translation_enabled', input.googleTranslationEnabled);
+    }
+    if (hasConcurrency) await control.setSetting('google_translation_concurrency', input.googleTranslationConcurrency);
+    await control.audit('admin', 'settings.translation.update', 'translation', {
+      ...(hasEnabled ? { googleTranslationEnabled: input.googleTranslationEnabled } : {}),
+      ...(hasConcurrency ? { googleTranslationConcurrency: input.googleTranslationConcurrency } : {})
+    });
+    return context.json({ data: {
+      googleTranslationEnabled: Boolean(await control.setting('google_translation_enabled', true)),
+      googleTranslationConcurrency: Number(await control.setting('google_translation_concurrency', 1)),
+      routes: await control.translationRoutes()
+    } });
+  });
+  app.put('/admin/api/settings/translation/routes', async (context) => {
+    const input = await context.req.json<{ routes?: unknown }>().catch(() => ({ routes: undefined }));
+    if (!Array.isArray(input.routes)) return context.json({ error: 'INVALID_TRANSLATION_ROUTES' }, 400);
+    const routes = await control.updateTranslationRoutes(input.routes);
+    await control.audit('admin', 'settings.translation.routes.update', 'translation', { routeCount: routes.length });
+    return context.json({ data: routes });
   });
 
   app.get('/admin/api/settings/youdao', async (context) => context.json({ data: await control.youdaoCredentialStatus() }));
@@ -770,33 +812,96 @@ export const createAdminApi = ({
   });
 
   app.get('/admin/api/providers', async (context) => context.json({ data: await control.listCredentials() }));
+  const resolveOpenAIBase = async <T extends Record<string, unknown>>(input: T, existingId?: string): Promise<T> => {
+    if (typeof input.baseUrl !== 'string' || !input.baseUrl.trim()) return input;
+    const apiKey = typeof input.apiKey === 'string' && input.apiKey.trim() ? input.apiKey.trim()
+      : existingId ? (await control.revealOpenAICompatibleCredential(existingId).catch(() => null))?.apiKey : undefined;
+    const baseUrl = await resolveOpenAICompatibleBaseUrl({ apiKey: apiKey || 'unresolved-key-placeholder', baseUrl: input.baseUrl });
+    return baseUrl ? { ...input, baseUrl } : input;
+  };
   app.post('/admin/api/providers', async (context) => {
-    const input = await context.req.json<CredentialInput>();
+    const raw = await context.req.json<CredentialInput>();
+    const input = raw.provider === 'openai-compatible' ? await resolveOpenAIBase(raw as CredentialInput & Record<string, unknown>) : raw;
     const id = await control.addCredential(input);
     await control.audit('admin', 'provider_key.create', id, { provider: input.provider });
-    if (isMapProvider(input.provider)) await wakeChina();
+    notifyCredentialChange(input.provider);
     return context.json({ data: { id } }, 201);
   });
   app.put('/admin/api/providers/:id', async (context) => {
-    await control.updateCredential(context.req.param('id'), await context.req.json<Record<string, unknown>>());
+    const id = context.req.param('id');
+    const raw = await context.req.json<Record<string, unknown>>();
+    const existing = typeof raw.baseUrl === 'string' ? await control.credentialForDiagnostics(id) : null;
+    const input = existing?.provider === 'openai-compatible' ? await resolveOpenAIBase(raw, id) : raw;
+    const provider = await control.updateCredential(id, input);
     await control.audit('admin', 'provider_key.update', context.req.param('id'));
-    await wakeChina();
+    notifyCredentialChange(provider);
     return context.json({ data: { success: true } });
   });
   app.delete('/admin/api/providers/:id', async (context) => {
-    await control.deleteCredential(context.req.param('id'));
+    const provider = await control.deleteCredential(context.req.param('id'));
     await control.audit('admin', 'provider_key.delete', context.req.param('id'));
-    await wakeChina();
+    notifyCredentialChange(provider);
     return context.json({ data: { success: true } });
   });
   app.post('/admin/api/providers/:id/reveal', async (context) => {
     return context.json({ data: await control.revealCredential(context.req.param('id')) });
   });
   app.post('/admin/api/providers/:id/reveal-fields', async (context) => {
-    return context.json({ data: await control.revealYoudaoCredential(context.req.param('id')) });
+    return context.json({ data: await control.revealCredentialFields(context.req.param('id')) });
+  });
+  app.post('/admin/api/providers/openai-compatible/models', async (context) => {
+    const client = requestClientAddress(context.req.raw, context.env?.remoteAddress, trustProxy);
+    if (!modelFetchRateLimiter(client)) return context.json({ error: 'MODEL_FETCH_RATE_LIMITED' }, 429, { 'Retry-After': '600' });
+    const input = await context.req.json<Record<string, unknown>>().catch(() => undefined);
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+      || Object.keys(input).some((key) => !['credentialId', 'apiKey', 'baseUrl', 'model', 'reasoningEffort'].includes(key))) {
+      return context.json({ error: 'INVALID_MODEL_FETCH_REQUEST' }, 400);
+    }
+    const credentialId = typeof input.credentialId === 'string' ? input.credentialId.trim() : '';
+    if (credentialId && !/^[a-f\d-]{36}$/iu.test(credentialId)) return context.json({ error: 'INVALID_MODEL_FETCH_REQUEST' }, 400);
+    try {
+      const stored = credentialId ? await control.revealOpenAICompatibleCredential(credentialId) : undefined;
+      const apiKey = typeof input.apiKey === 'string' && input.apiKey.trim() ? input.apiKey.trim() : stored?.apiKey;
+      const baseUrl = typeof input.baseUrl === 'string' && input.baseUrl.trim() ? input.baseUrl.trim() : stored?.baseUrl;
+      const catalog = await fetchOpenAICompatibleModelCatalog({ apiKey, baseUrl }, fetch);
+      await control.audit('admin', 'provider_models.fetch', credentialId || 'temporary', { modelCount: catalog.models.length });
+      return context.json({ data: catalog });
+    } catch (error) {
+      const cause = error as { code?: string; outcome?: string; retryAt?: string | null };
+      const code = cause.code || 'MODEL_FETCH_FAILED';
+      const status = code === 'INVALID_OPENAI_COMPATIBLE_CREDENTIAL' ? 400
+        : cause.outcome === 'qps' ? 429 : 502;
+      return context.json({ error: code, ...(cause.outcome ? { outcome: cause.outcome } : {}) }, status,
+        cause.retryAt ? { 'Retry-After': String(Math.max(1, Math.ceil((Date.parse(cause.retryAt) - Date.now()) / 1000))) } : undefined);
+    }
   });
   app.post('/admin/api/providers/:credential/test', async (context) => {
     const value = context.req.param('credential');
+    const selected = (await control.listCredentials()).find((item) => item.id === value);
+    if (value === 'deepl' || selected?.provider === 'deepl') {
+      if (!credentialBroker) return context.json({ error: 'DEEPL_REQUIRES_BROKER' }, 503);
+      try {
+        const quota = await credentialBroker.request('deepl.usage', selected ? { credentialId: value } : {}, { maxDispatches: 1 });
+        await control.audit('admin', 'provider_key.test', value);
+        return context.json({ data: { success: true, resultCount: 0, quota } });
+      } catch {
+        return context.json({ error: 'PROVIDER_TEST_FAILED' }, 502);
+      }
+    }
+    if (selected?.provider === 'openai-compatible') {
+      const credential = await control.credentialForDiagnostics(value);
+      if (!credential) return context.json({ error: 'NO_AVAILABLE_KEY' }, 409);
+      const prompt = (await control.translationRouteForCredential(credential.id))?.prompt || undefined;
+      const result = await diagnoseOpenAICompatible(credential.secret, { mode: 'translate', prompt });
+      const intact = Boolean(result.translations?.every((item, index) => preservesAddressNumbers(OPENAI_COMPATIBLE_DIAGNOSTIC_VALUES[index], item)
+        && preservesAddressIdentifiers(OPENAI_COMPATIBLE_DIAGNOSTIC_VALUES[index], item)));
+      if (result.success && intact) await control.reportCredential(credential.id, 'success');
+      else if (['auth', 'quota', 'qps', 'network'].includes(result.outcome)) await control.reportCredential(credential.id, result.outcome as 'auth' | 'quota' | 'qps' | 'network');
+      notifyCredentialChange(credential.provider);
+      return result.success && intact
+        ? context.json({ data: { success: true, resultCount: result.translations?.length || 0 } })
+        : context.json({ error: 'PROVIDER_TEST_FAILED', detail: result.code || 'OPENAI_COMPATIBLE_IDENTIFIERS_CHANGED', outcome: result.outcome }, 502);
+    }
     const provider = value as CredentialProviderName;
     const credential = (credentialProviderNames as readonly string[]).includes(provider)
       ? await control.acquireCredential(provider)
@@ -809,20 +914,42 @@ export const createAdminApi = ({
         let quota: ProviderQuotaObservation | undefined;
         const result = await providerFetcher[credential.provider]('北京市', 1, credential.secret, fetch, (value) => { quota = value; });
         resolved = { success: true, resultCount: result.candidates.length, quota };
-      } else resolved = await testServiceCredential(credential.provider, credential.secret);
+      } else resolved = await testServiceCredential(credential.provider, credential.secret, fetch,
+        credential.provider === 'openai-compatible'
+          ? { prompt: (await control.translationRouteForCredential(credential.id))?.prompt || undefined } : {});
       await control.reportCredential(credential.id, 'success', 'quota' in resolved ? resolved.quota : undefined);
-      if (isMapProvider(credential.provider)) await wakeChina();
+      notifyCredentialChange(credential.provider);
       return context.json({ data: resolved });
     } catch (error) {
       const outcome = error instanceof ProviderRequestError ? error.outcome : 'network';
       await control.reportCredential(credential.id, outcome, error instanceof ProviderRequestError
         ? { retryAt: error.retryAt, period: error.quotaPeriod } : undefined);
-      if (isMapProvider(credential.provider)) await wakeChina();
+      notifyCredentialChange(credential.provider);
       return context.json({ error: 'PROVIDER_TEST_FAILED', outcome }, 502);
     }
   });
 
-  app.get('/admin/api/china/status', async (context) => context.json({ data: await china.status() }));
+  app.post('/admin/api/providers/:credential/diagnose', async (context) => {
+    const input = await context.req.json<{ mode?: string }>().catch((): { mode?: string } => ({}));
+    const mode = input.mode === 'translate' ? 'translate' : 'chat';
+    const credential = await control.credentialForDiagnostics(context.req.param('credential'));
+    if (!credential || credential.provider !== 'openai-compatible') return context.json({ error: 'PROVIDER_NOT_FOUND' }, 404);
+    const prompt = (await control.translationRouteForCredential(credential.id))?.prompt || undefined;
+    const result = await diagnoseOpenAICompatible(credential.secret, { mode, prompt });
+    if (result.success && result.translations && mode === 'translate') {
+      const intact = result.translations.every((value, index) => preservesAddressNumbers(OPENAI_COMPATIBLE_DIAGNOSTIC_VALUES[index], value)
+        && preservesAddressIdentifiers(OPENAI_COMPATIBLE_DIAGNOSTIC_VALUES[index], value));
+      if (!intact) Object.assign(result, { success: false, outcome: 'request', code: 'OPENAI_COMPATIBLE_IDENTIFIERS_CHANGED',
+        steps: [...result.steps, { kind: 'error', key: 'identifiersChanged' }] });
+      else result.steps.push({ kind: 'success', key: 'done' });
+    }
+    if (result.success) await control.reportCredential(credential.id, 'success');
+    else if (['auth', 'quota', 'qps', 'network'].includes(result.outcome)) await control.reportCredential(credential.id, result.outcome as 'auth' | 'quota' | 'qps' | 'network');
+    notifyCredentialChange(credential.provider);
+    await control.audit('admin', 'provider_key.diagnose', credential.id, { mode, success: result.success, code: result.code || null });
+    return context.json({ data: result });
+  });
+
   app.get('/admin/api/address-data', async (context) => {
     return context.json({ data: await loadAddressDataSnapshot() });
   });
@@ -865,12 +992,6 @@ export const createAdminApi = ({
       throw error;
     }
   });
-  app.post('/admin/api/china/sync', async (context) => {
-    const input = await context.req.json<{ cities?: string[]; providers?: ProviderName[]; maxPages?: number }>().catch(() => ({}));
-    const id = await china.start(input);
-    await control.audit('admin', 'china.sync.start', id, input);
-    return context.json({ data: { id } }, 202);
-  });
   app.post('/admin/api/china/areacity', async (context) => {
     const input = await context.req.json<{ source?: string; version?: string }>();
     if (!input.source || !input.version) return context.json({ error: 'SOURCE_AND_VERSION_REQUIRED' }, 400);
@@ -884,7 +1005,6 @@ export const createAdminApi = ({
       FROM cn_communities_v2 WHERE active=1 GROUP BY city,district ORDER BY city,district`).all()).results;
     return context.json({ data: rows });
   });
-  app.get('/admin/api/runs', async (context) => context.json({ data: await control.runs(100) }));
   return app;
 };
 
@@ -937,7 +1057,8 @@ export const createAccessApi = (control: ControlStore, {
       nodes,
       countries,
       metrics: {
-        countryCount: countries.filter((node) => node.residentialCount > 0).length,
+        countryCount: countries.length,
+        addressTotal: countries.reduce((total, node) => total + node.totalCount, 0),
         residentialTotal: countries.reduce((total, node) => total + node.residentialCount, 0),
         coveredLowest,
         totalLowest,

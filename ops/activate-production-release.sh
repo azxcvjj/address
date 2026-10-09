@@ -10,6 +10,7 @@ STATE_ROOT=$ROOT/runtime/deploy
 GATEWAY_ROOT=$ROOT/runtime/gateway
 DRAIN_SECONDS=${ADDRESS_DEPLOY_DRAIN_SECONDS:-30}
 RELEASE_RETENTION=${ADDRESS_RELEASE_RETENTION:-5}
+SYNC_WAIT_SECONDS=${ADDRESS_DEPLOY_SYNC_WAIT_SECONDS:-1800}
 
 if [[ ! "$RELEASE_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
   echo "Release ID is invalid" >&2
@@ -21,6 +22,10 @@ if [[ ! "$RELEASE_IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || [[ "$RELEASE_IMAGE" == *:
 fi
 if [[ ! "$DRAIN_SECONDS" =~ ^[0-9]+$ ]] || (( DRAIN_SECONDS > 600 )); then
   echo "ADDRESS_DEPLOY_DRAIN_SECONDS must be between 0 and 600" >&2
+  exit 1
+fi
+if [[ ! "$SYNC_WAIT_SECONDS" =~ ^[0-9]+$ ]] || (( SYNC_WAIT_SECONDS > 7200 )); then
+  echo "ADDRESS_DEPLOY_SYNC_WAIT_SECONDS must be between 0 and 7200" >&2
   exit 1
 fi
 if [[ ! "$RELEASE_RETENTION" =~ ^[0-9]+$ ]] || (( RELEASE_RETENTION < 2 || RELEASE_RETENTION > 20 )); then
@@ -106,6 +111,18 @@ cleanup_release_artifacts() {
   done < <(find "$releases_root" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' | sort -nr | cut -d' ' -f2-)
   find "$ROOT/runtime" -mindepth 1 -maxdepth 2 -type f \
     \( -name 'address-*.tar.gz' -o -name '.deploy-*.tar.gz' \) -mtime +1 -delete
+  # Each release builds a ~2.5 GB image; keep only images of retained releases or ones a container still uses.
+  local repository=${RELEASE_IMAGE%%:*} kept=" $protected " used image
+  for target in "$releases_root"/*/; do
+    if [[ -d "$target" ]]; then kept+="$(basename "$target") "; fi
+  done
+  used=$(docker ps -a --format '{{.Image}}')
+  while IFS= read -r image; do
+    if [[ "$kept" != *" ${image#"$repository":} "* ]] && ! grep -qxF "$image" <<<"$used"; then
+      docker image rm "$image" >/dev/null || true
+    fi
+  done < <(docker images --format '{{.Repository}}:{{.Tag}}' | awk -v prefix="$repository:" 'index($0, prefix) == 1')
+  docker builder prune -f --filter until=24h >/dev/null || true
 }
 
 verify_slot() {
@@ -149,7 +166,7 @@ trap rollback_cutover ERR INT TERM
 
 echo "==> preparing PostgreSQL and migration"
 compose up -d --wait --wait-timeout 180 postgres
-compose run --rm --no-deps -T migrate
+compose run --rm --no-deps -T migrate node node_modules/tsx/dist/cli.mjs server/database/migrate.ts --skip-coverage
 
 echo "==> starting $TARGET_SLOT release $RELEASE_ID"
 compose --profile "production-$TARGET_SLOT" up -d --no-deps --wait --wait-timeout 180 \
@@ -199,6 +216,15 @@ for legacy_service in api credential-broker; do
   if compose ps --status running --services | grep -Fx "$legacy_service" >/dev/null; then
     compose stop -t 30 "$legacy_service"
   fi
+done
+
+active_sync_runs() {
+  compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT COUNT(*) FROM control.sync_runs WHERE status='"'"'running'"'"'"' 2>/dev/null || echo 0
+}
+sync_wait_deadline=$((SECONDS + SYNC_WAIT_SECONDS))
+while (( SECONDS < sync_wait_deadline )) && [[ "$(active_sync_runs)" =~ ^[1-9] ]]; do
+  echo "==> waiting for the running sync job before updating sync"
+  sleep 10
 done
 
 echo "==> updating singleton sync service"

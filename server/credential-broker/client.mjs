@@ -22,17 +22,24 @@ export class CredentialBrokerClient {
     }
   }
 
-  async post(path, body, { signal } = {}) {
+  async post(path, body, { signal, onDispatch, timeoutMs = 35_000 } = {}) {
     let response;
     try {
       response = await this.fetchImpl(`${this.url}${path}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(35_000)]) : AbortSignal.timeout(35_000)
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs)
       });
     } catch (cause) {
       throw Object.assign(new Error('Credential Broker is unavailable', { cause }), { code: 'BROKER_UNAVAILABLE' });
+    }
+    if (onDispatch) {
+      const count = response.headers.get('x-address-upstream-requests');
+      if (count === null || !/^\d+$/u.test(count) || Number(count) > 32) {
+        throw Object.assign(new Error('Credential Broker did not return request accounting'), { code: 'BROKER_INVALID_RESPONSE' });
+      }
+      onDispatch(Number(count));
     }
     const payload = await parseResponse(response);
     if (!response.ok) throw Object.assign(new Error(payload.code || 'Credential Broker request failed'), {
@@ -43,8 +50,10 @@ export class CredentialBrokerClient {
     return payload;
   }
 
-  async request(operation, parameters, { requestId = randomUUID(), signal } = {}) {
-    const payload = await this.post('/v1/requests', { requestId, operation, parameters }, { signal });
+  async request(operation, parameters, { requestId = randomUUID(), signal, maxDispatches, onDispatch, timeoutMs } = {}) {
+    const payload = await this.post('/v1/requests', {
+      requestId, operation, parameters, ...(maxDispatches === undefined ? {} : { maxDispatches })
+    }, { signal, onDispatch, timeoutMs });
     return payload.data;
   }
 

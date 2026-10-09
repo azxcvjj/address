@@ -1,41 +1,84 @@
+import { randomUUID } from 'node:crypto';
 import { addressQualitySqlClause } from '../../src/domain/address-quality.mjs';
+import { foreignAddressScriptPattern, semanticAddressFields } from '../../src/domain/address-localization.mjs';
+import { addressContracts } from '../../src/domain/address-contracts.mjs';
+import { administrativeKeySql, administrativeValueSql, refreshAdministrativeAssignments } from './administrative-assignments.mjs';
 
-const nativeSemanticFields = ['street', 'locality', 'postalLocality', 'district', 'dependentLocality', 'admin1', 'buildingName'];
-const localizedHanClause = (prefix = '') => `(${nativeSemanticFields
-  .map((field) => `(${prefix}component_variants_json::jsonb -> 'zh-CN' ->> '${field}') ~ '[一-龥]'`)
-  .join(' OR ')})`;
+const localizedHanClause = (prefix = '') => {
+  const value = (language, field) => `${prefix}component_variants_json::jsonb -> '${language}' ->> '${field}'`;
+  const country = `${prefix}country_code`;
+  const anyHan = `(${semanticAddressFields.map((field) => `(${value('zh-CN', field)} ~ '[一-龥]')`).join(' OR ')})`;
+  const requiredCountryPredicate = (field) => {
+    const countries = Object.entries(addressContracts)
+      .filter(([, contract]) => field === 'street' || contract.required.includes(field))
+      .map(([code]) => `'${code}'`);
+    return countries.length ? `${country} NOT IN (${countries.join(',')})` : 'TRUE';
+  };
+  const unchangedIdentifier = (field) => `${value('native', field)} ~ '^[A-Z]{1,6}[-./ ]{0,1}[0-9]+([-./ ]{0,1}[A-Z0-9]+)*$'`;
+  const translated = semanticAddressFields.filter((field) => field !== 'buildingName').map((field) => {
+    const original = value('native', field);
+    const ordinaryStreet = field === 'street' ? ` OR ${prefix}property_type NOT IN ('residential','apartment')` : '';
+    return `(${requiredCountryPredicate(field)} OR trim(${original})='' OR ${value('zh-CN', field)} ~ '[一-龥]'
+      OR NOT (${original} ~ '[^0-9[:punct:][:space:]]') OR ${unchangedIdentifier(field)}${ordinaryStreet})`;
+  });
+  return [anyHan, ...translated].join(' AND ');
+};
 
-const publishableClause = (prefix = '') => [
+export const addressLocalizationSqlClause = (prefix = '') => [
+  localizedHanClause(prefix),
+  ...['en', 'zh-CN'].map((language) => `NOT (concat_ws('',${semanticAddressFields
+    .map((field) => `${prefix}component_variants_json::jsonb -> '${language}' ->> '${field}'`).join(',')})
+      ~ '${foreignAddressScriptPattern(language)}')`)
+].join(' AND ');
+
+export const addressPublicationSqlClause = (prefix = '') => [
   `${prefix}quality_score >= 0.7`,
   addressQualitySqlClause(prefix),
-  localizedHanClause(prefix)
+  addressLocalizationSqlClause(prefix)
 ].join(' AND ');
 
 export const generationIndexRowCount = async (database) => Number(
   await database.prepare('SELECT COUNT(*) AS total FROM address_generation_index WHERE active=1').first('total') || 0
 );
 
-export const refreshAddressGenerationIndex = async (database, countryCode) => {
+export const refreshAddressGenerationIndex = async (database, countryCode, { addressIds } = {}) => {
   const scope = String(countryCode || '').trim().toUpperCase();
   if (!scope) return 0;
+  const ids = addressIds === undefined ? null : [...new Set(addressIds.map(String))];
+  if (ids && !ids.length) return generationIndexRowCountForCountry(database, scope);
+  await refreshAdministrativeAssignments(database, scope, { addressIds: ids || undefined });
+  const placeholders = ids?.map(() => '?').join(',');
   const updatedAt = new Date().toISOString();
   const source = 'address_pool_runtime runtime';
-  const eligible = publishableClause('runtime.');
-  await database.prepare('UPDATE address_generation_index SET active=0 WHERE country_code=?').bind(scope).run();
-  await database.prepare(`
-    INSERT INTO address_generation_index(
-      address_id,country_code,admin1_key,admin1_code_key,locality_key,postal_locality_key,
-      district_key,postcode_key,locality,postal_locality,district,postcode,street,house_number,
-      building_name,search_text,random_key,country_rank,residential_rank,residential_ready,active,source_revision,updated_at
-    ) SELECT ranked.id,ranked.country_code,ranked.admin1_key,ranked.admin1_code_key,
-      ranked.locality_key,ranked.postal_locality_key,ranked.district_key,ranked.postcode_key,
-      ranked.locality,ranked.postal_locality,ranked.district,ranked.postcode,ranked.street,
-      ranked.house_number,ranked.building_name,
-      lower(concat_ws(' ',ranked.house_number,ranked.street,ranked.building_name,ranked.district,
-        ranked.locality,ranked.postal_locality,ranked.admin1,ranked.admin1_code,ranked.postcode)),
-      ranked.random_key,ranked.country_rank,ranked.residential_rank,ranked.ready,
-      1,concat_ws(':',ranked.dataset_id,ranked.dataset_version),?
-    FROM (
+  const eligible = addressPublicationSqlClause('runtime.');
+  // The current maxima come from the rank indexes once; inlined as a subquery the planner re-evaluated them per row.
+  const maximumRank = async (column, readiness) => Number(await database.prepare(`SELECT ${column} AS value FROM address_generation_index
+    WHERE country_code=? AND active=1${readiness} AND ${column} IS NOT NULL ORDER BY ${column} DESC LIMIT 1`).bind(scope).first('value') || 0);
+  const base = ids ? [await maximumRank('country_rank', ''), await maximumRank('residential_rank', ' AND residential_ready=1')] : [];
+  // A targeted refresh keeps existing ranks and appends new rows after the current maximum, so publishing a
+  // batch never renumbers the whole country; random selection tolerates the rare gap left by a deactivation.
+  const rankedRows = ids ? `
+      SELECT numbered.*,
+        COALESCE(numbered.current_country_rank, base.country_rank + numbered.country_seq) AS country_rank,
+        CASE WHEN numbered.ready=1 THEN COALESCE(numbered.current_residential_rank, base.residential_rank + numbered.residential_seq) END
+          AS residential_rank
+      FROM (
+        SELECT eligible_runtime.*,
+          ROW_NUMBER() OVER (PARTITION BY new_country ORDER BY random_key,id) AS country_seq,
+          CASE WHEN new_residential=1 THEN ROW_NUMBER() OVER (PARTITION BY new_residential ORDER BY random_key,id) END AS residential_seq
+        FROM (
+          SELECT runtime.*,
+            CASE WHEN runtime.property_type IN ('residential','apartment') AND runtime.residential_evidence=1 THEN 1 ELSE 0 END AS ready,
+            current_index.country_rank AS current_country_rank,current_index.residential_rank AS current_residential_rank,
+            CASE WHEN current_index.country_rank IS NULL THEN 1 ELSE 0 END AS new_country,
+            CASE WHEN runtime.property_type IN ('residential','apartment') AND runtime.residential_evidence=1
+              AND current_index.residential_rank IS NULL THEN 1 ELSE 0 END AS new_residential
+          FROM ${source}
+          LEFT JOIN address_generation_index current_index ON current_index.address_id=runtime.id AND current_index.active=1
+          WHERE runtime.country_code=? AND runtime.id IN (${placeholders}) AND runtime.active=1 AND ${eligible}
+        ) eligible_runtime
+      ) numbered,
+      (SELECT CAST(? AS bigint) AS country_rank,CAST(? AS bigint) AS residential_rank) base` : `
       SELECT eligible_runtime.*,
         ROW_NUMBER() OVER (ORDER BY random_key,id) AS country_rank,
         CASE WHEN ready=1 THEN ROW_NUMBER() OVER (PARTITION BY ready ORDER BY random_key,id) END AS residential_rank
@@ -44,7 +87,24 @@ export const refreshAddressGenerationIndex = async (database, countryCode) => {
           CASE WHEN runtime.property_type IN ('residential','apartment') AND runtime.residential_evidence=1 THEN 1 ELSE 0 END AS ready
         FROM ${source}
         WHERE runtime.country_code=? AND runtime.active=1 AND ${eligible}
-      ) eligible_runtime
+      ) eligible_runtime`;
+  await database.batch([
+    ...(ids ? [] : [database.prepare('UPDATE address_generation_index SET active=0 WHERE country_code=?').bind(scope)]),
+    database.prepare(`
+    INSERT INTO address_generation_index(
+      address_id,country_code,admin1_key,admin1_code_key,locality_key,postal_locality_key,
+      district_key,postcode_key,locality,postal_locality,district,postcode,street,house_number,
+      building_name,search_text,random_key,country_rank,residential_rank,residential_ready,active,source_revision,updated_at
+    ) SELECT ranked.id,ranked.country_code,${administrativeKeySql('admin1', 'ranked')},${administrativeKeySql('admin1_code', 'ranked')},
+      ${administrativeKeySql('locality', 'ranked')},ranked.postal_locality_key,ranked.district_key,ranked.postcode_key,
+      ${administrativeValueSql('locality', 'ranked')},ranked.postal_locality,ranked.district,ranked.postcode,ranked.street,
+      ranked.house_number,ranked.building_name,
+      lower(concat_ws(' ',ranked.house_number,ranked.street,ranked.building_name,ranked.district,
+        ${administrativeValueSql('locality', 'ranked')},ranked.postal_locality,${administrativeValueSql('admin1', 'ranked')},
+        ${administrativeValueSql('admin1_code', 'ranked')},ranked.postcode)),
+      ranked.random_key,ranked.country_rank,ranked.residential_rank,ranked.ready,
+      1,concat_ws(':',ranked.dataset_id,ranked.dataset_version),?
+    FROM (${rankedRows}
     ) ranked
     ON CONFLICT(address_id) DO UPDATE SET
       country_code=excluded.country_code,admin1_key=excluded.admin1_key,admin1_code_key=excluded.admin1_code_key,
@@ -55,29 +115,49 @@ export const refreshAddressGenerationIndex = async (database, countryCode) => {
       search_text=excluded.search_text,random_key=excluded.random_key,country_rank=excluded.country_rank,
       residential_rank=excluded.residential_rank,residential_ready=excluded.residential_ready,
       active=1,source_revision=excluded.source_revision,updated_at=excluded.updated_at
-  `).bind(updatedAt, scope).run();
+  `).bind(updatedAt, scope, ...(ids ? [...ids, ...base] : [])),
+    ...(ids ? [database.prepare(`UPDATE address_generation_index SET active=0
+      WHERE country_code=? AND address_id IN (${placeholders}) AND updated_at<>?`).bind(scope, ...ids, updatedAt)] : []),
+    database.prepare(`INSERT INTO address_pool_revisions(kind,version) VALUES (?,?)
+      ON CONFLICT(kind) DO UPDATE SET version=excluded.version`).bind(`generation:${scope}`, randomUUID())
+  ]);
   return generationIndexRowCountForCountry(database, scope);
 };
 
+export const activePoolCountries = async (database) => new Set((await database.prepare(
+  'SELECT DISTINCT country_code FROM address_pool WHERE active=1').all()).results.map((row) => row.country_code));
+
+// Each country is checked on its own so one large country cannot push a whole-pool scan past the statement timeout.
 export const refreshStaleAddressGenerationIndexes = async (database) => {
-  const eligible = publishableClause('runtime.');
-  const rows = (await database.prepare(`WITH source_counts AS (
-      SELECT runtime.country_code,COUNT(*) AS source_count
-      FROM address_pool_runtime runtime
-      WHERE runtime.active=1 AND ${eligible}
-      GROUP BY runtime.country_code
-    ), index_counts AS (
-      SELECT country_code,COUNT(*) FILTER (WHERE active=1) AS index_count,
-        COUNT(*) FILTER (WHERE active=1 AND country_rank IS NULL) AS missing_ranks
-      FROM address_generation_index GROUP BY country_code
-    )
-    SELECT source_counts.country_code
-    FROM source_counts LEFT JOIN index_counts USING(country_code)
-    WHERE source_counts.source_count<>COALESCE(index_counts.index_count,0)
-      OR COALESCE(index_counts.missing_ranks,0)>0
-    ORDER BY source_counts.country_code`).all()).results || [];
-  for (const { country_code: countryCode } of rows) await refreshAddressGenerationIndex(database, countryCode);
-  return rows.map(({ country_code: countryCode }) => countryCode);
+  const eligible = addressPublicationSqlClause('runtime.');
+  const countries = (await database.prepare(`SELECT country_code FROM sync_country_policies
+    UNION SELECT DISTINCT country_code FROM address_generation_index ORDER BY country_code`).all()).results || [];
+  const populated = await activePoolCountries(database);
+  const refreshed = [];
+  const failed = [];
+  for (const { country_code: countryCode } of countries) {
+    try {
+      const source = !populated.has(countryCode) ? null : await database.prepare(`SELECT COUNT(DISTINCT runtime.id) AS source_count,
+          COUNT(DISTINCT generation.address_id) AS matched_index_count
+        FROM address_pool_runtime runtime
+        LEFT JOIN address_generation_index generation ON generation.address_id=runtime.id
+          AND generation.country_code=runtime.country_code AND generation.active=1
+        WHERE runtime.country_code=? AND runtime.active=1 AND ${eligible}`).bind(countryCode).first();
+      const index = await database.prepare(`SELECT COUNT(*) FILTER (WHERE active=1) AS index_count,
+          COUNT(*) FILTER (WHERE active=1 AND country_rank IS NULL) AS missing_ranks,
+          COUNT(*) FILTER (WHERE active=1 AND residential_ready=1 AND residential_rank IS NULL) AS missing_residential_ranks
+        FROM address_generation_index WHERE country_code=?`).bind(countryCode).first();
+      const sourceCount = Number(source?.source_count || 0);
+      if (sourceCount === Number(index?.index_count || 0) && sourceCount === Number(source?.matched_index_count || 0)
+        && !Number(index?.missing_ranks || 0) && !Number(index?.missing_residential_ranks || 0)) continue;
+      await refreshAddressGenerationIndex(database, countryCode);
+      refreshed.push(countryCode);
+    } catch (error) {
+      failed.push(`${countryCode}:${error?.code || error?.message || error}`);
+    }
+  }
+  if (failed.length) throw Object.assign(new Error(`Generation index consistency failed for ${failed.join(', ')}`), { refreshed });
+  return refreshed;
 };
 
 const generationIndexRowCountForCountry = async (database, countryCode) => Number(
@@ -86,7 +166,11 @@ const generationIndexRowCountForCountry = async (database, countryCode) => Numbe
 );
 
 export const refreshAddressGenerationIndexIfEmpty = async (database, countryCodes) => {
-  if (await generationIndexRowCount(database)) return false;
-  for (const countryCode of countryCodes) await refreshAddressGenerationIndex(database, countryCode);
-  return true;
+  let refreshed = false;
+  for (const countryCode of countryCodes) {
+    if (await generationIndexRowCountForCountry(database, countryCode)) continue;
+    await refreshAddressGenerationIndex(database, countryCode);
+    refreshed = true;
+  }
+  return refreshed;
 };

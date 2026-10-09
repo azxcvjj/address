@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { initializeTestDatabase, openTestDatabase } from './helpers/postgres-test-database.mjs';
 import { createSyncApi } from '../server/sync/api.mjs';
 import { sourceAdapterRevisions } from '../server/sync/source-adapters.mjs';
+import { CHINA_PRIORITY_TARGET } from '../server/sync/address-policy.mjs';
 import {
   computeQueueSnapshot, countryFingerprint, createQueueSources, createSyncQueue, evaluateAttempt,
   estimateDuration, executionFailureFingerprint, legacyCountryFingerprint, nextQuotaResetTime, nextWakeAt, orderRunnable,
@@ -117,6 +118,13 @@ describe('attempt evaluation and latching', () => {
     const result = evaluateAttempt({ ...base, jobSucceeded: true, netGrowth: 0,
       goalDeficitBefore: 25, goalDeficitAfter: 23 });
     expect(result.action).toBe('checked');
+  });
+
+  it('reruns a growing source soon only when its per-run growth step capped the import', () => {
+    const capped = evaluateAttempt({ ...base, jobSucceeded: true, netGrowth: 50_000, growthCapped: true, probeIntervalMs: 30 * 86_400_000 });
+    const finished = evaluateAttempt({ ...base, jobSucceeded: true, netGrowth: 50_000, probeIntervalMs: 30 * 86_400_000 });
+    expect(capped).toMatchObject({ action: 'checked', nextAttemptAt: '2026-08-02T10:01:00.000Z' });
+    expect(finished).toMatchObject({ action: 'checked', nextAttemptAt: '2026-09-01T10:00:00.000Z' });
   });
 
   it('continues a successful checkpointed source until its full scan is complete', () => {
@@ -375,6 +383,46 @@ describe('attempt evaluation and latching', () => {
     expect(countryFingerprint({
       adapterRevisions: [['japan-abr-residential', 'abr-v1']], sourceVersions: [['japan-abr-residential', 'v1']]
     })).toBe(sourceFingerprint);
+  });
+
+  it('releases Geofabrik redirect discovery failures without touching materialize failures', () => {
+    const sourceFingerprint = countryFingerprint({ adapterRevisions: [['google-residential-enrichment-ph', 'g-v9']], sourceVersions: [] });
+    const generic = (phase) => executionFailureFingerprint(sourceFingerprint, '', phase, 'overture');
+    for (const adapter of ['google-residential-enrichment', 'geofabrik']) {
+      expect(executionFailureFingerprint(sourceFingerprint, '', 'discover', adapter)).not.toBe(generic('discover'));
+    }
+    expect(executionFailureFingerprint(sourceFingerprint, '', 'materialize', 'geofabrik')).toBe(generic('materialize'));
+  });
+});
+
+describe('published queue snapshots', () => {
+  it('publishes changed snapshots and throttles recomputation while China blocks the queue', async () => {
+    const facts = stubFacts();
+    const sources = { ...stubSources(facts, {}), chinaPriority: async () => ({ blocksQueue: true, executionState: 'running' }) };
+    const addressFacts = vi.spyOn(sources, 'addressFacts');
+    const history = { schedulerHeartbeat: vi.fn(async () => {}), publishQueueSnapshot: vi.fn(async () => {}) };
+    let current = new Date('2026-08-02T10:00:00Z');
+    const log = { log: vi.fn(), error: () => {} };
+    const queue = createSyncQueue({
+      environment: {}, coordinator: { currentJob: null }, stateDir: stateDir(), sources, history,
+      loadCatalog: async () => ({ shards: stubCatalogShards }), now: () => current, cooldownMs: 0, log
+    });
+
+    await queue.tick();
+    current = new Date(current.getTime() + 5_000);
+    await queue.tick();
+    expect(addressFacts).toHaveBeenCalledTimes(1);
+    expect(history.publishQueueSnapshot).toHaveBeenCalledTimes(1);
+    const [json, at] = history.publishQueueSnapshot.mock.calls[0];
+    expect(at).toBe('2026-08-02T10:00:00.000Z');
+    expect(JSON.parse(json)).toMatchObject({ generatedAt: at, entries: expect.any(Array) });
+    expect(JSON.parse(json).entries.every((entry) => !('sourceExecution' in entry))).toBe(true);
+    expect(log.log).toHaveBeenCalledTimes(1);
+
+    current = new Date(current.getTime() + 60_000);
+    await queue.tick();
+    expect(addressFacts).toHaveBeenCalledTimes(2);
+    expect(history.publishQueueSnapshot).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -653,6 +701,18 @@ describe('PostgreSQL queue state', () => {
       US: { shards: { US: { state: 'latched' } } }
     } });
     await expect(readFile(legacyFile, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    database.close();
+  });
+
+  it('does not delete or ignore a corrupt legacy queue state file', async () => {
+    const database = openTestDatabase();
+    const directory = stateDir();
+    const legacyFile = resolve(directory, 'queue-state.json');
+    await mkdir(directory, { recursive: true });
+    await writeFile(legacyFile, '{"countries":');
+    const store = new PostgresQueueStateStore(database, legacyFile);
+    await expect(store.load()).rejects.toMatchObject({ code: 'QUEUE_STATE_INVALID' });
+    expect(await readFile(legacyFile, 'utf8')).toBe('{"countries":');
     database.close();
   });
 
@@ -1284,7 +1344,8 @@ describe('queue engine', () => {
         return { accepted: true, job: { id: `sync-${coordinator.calls.length}` } };
       },
       waitForIdle: async () => {},
-      getJob: async (id) => ({ id, status: coordinator.jobStatus })
+      sourceOutcomes: [],
+      getJob: async (id) => ({ id, status: coordinator.jobStatus, sourceOutcomes: coordinator.sourceOutcomes })
     };
     return coordinator;
   };
@@ -1496,6 +1557,32 @@ describe('queue engine', () => {
     expect(coordinator.calls).toHaveLength(2);
   });
 
+  it('defers a country whose imported rows are still waiting for publication', async () => {
+    const facts = stubFacts();
+    facts.deficits.belowTarget = new Set(['NL']);
+    const coordinator = fakeCoordinator();
+    let backlog = 20_001;
+    const log = { log: vi.fn(), error: () => {} };
+    const queue = createSyncQueue({
+      environment: {}, coordinator, stateDir: stateDir(),
+      sources: { ...stubSources(facts, {}), unpublishedBacklog: async () => backlog },
+      loadCatalog: async () => ({ shards: stubCatalogShards }), cooldownMs: 0, log, backlogDeferMs: 60_000
+    });
+    await queue.tick();
+    expect(coordinator.calls).toEqual([]);
+    expect(log.log).toHaveBeenCalledWith('[sync-queue] NL deferred unpublished=20001');
+    backlog = 20_000;
+    await queue.tick();
+    expect(coordinator.calls).toEqual([]);
+    const later = createSyncQueue({
+      environment: {}, coordinator, stateDir: stateDir(),
+      sources: { ...stubSources(facts, {}), unpublishedBacklog: async () => backlog },
+      loadCatalog: async () => ({ shards: stubCatalogShards }), cooldownMs: 0, log: { log: () => {}, error: () => {} }
+    });
+    await later.tick();
+    expect(coordinator.calls).toEqual([{ trigger: 'queue', shards: ['oa-nl'] }]);
+  });
+
   it('backs off after a transient failure and checks the current source after growth', async () => {
     const facts = stubFacts();
     facts.deficits.belowTarget = new Set(['US']);
@@ -1524,6 +1611,7 @@ describe('queue engine', () => {
       coordinator.calls.push({ trigger, shards });
       facts.counts.US += 40;
       facts.rules.US.total.current += 40;
+      coordinator.sourceOutcomes = [{ shardId: 'oa-us', status: 'imported', netGrowth: 40, changedCount: 40 }];
       return { accepted: true, job: { id: 'sync-growth' } };
     };
     // Force the retry to be due immediately.
@@ -1537,6 +1625,25 @@ describe('queue engine', () => {
     });
     expect((await queue.snapshot()).entries.find((value) => value.countryCode === 'US'))
       .toMatchObject({ state: 'scheduled_wait', reason: 'source_version_checked' });
+  });
+
+  it('latches a source whose own import added nothing while translations raised the country total', async () => {
+    const facts = stubFacts();
+    facts.deficits.belowTarget = new Set(['US']);
+    const coordinator = fakeCoordinator();
+    coordinator.trigger = async (trigger, { shards }) => {
+      coordinator.calls.push({ trigger, shards });
+      facts.counts.US += 40;
+      facts.rules.US.total.current += 40;
+      coordinator.sourceOutcomes = [{ shardId: 'oa-us', status: 'unchanged', netGrowth: 0, changedCount: 0 }];
+      return { accepted: true, job: { id: 'sync-background-growth' } };
+    };
+    const queue = createSyncQueue({
+      environment: {}, coordinator, stateDir: stateDir(), sources: stubSources(facts, {}),
+      loadCatalog: async () => ({ shards: stubCatalogShards }), cooldownMs: 0, log: { log: () => {}, error: () => {} }
+    });
+    await queue.tick();
+    expect((await queue.store.load()).countries.US.shards['oa-us']).toMatchObject({ latched: true });
   });
 
   it('opens a country-adapter circuit after two shards hit the same systemic failure', async () => {
@@ -1645,6 +1752,22 @@ describe('China queue priority', () => {
       blocksQueue: false,
       executionState: 'uninitialized'
     });
+    database.close();
+  });
+
+  it('rotates China with other countries once its original volume goal and coverage are met', async () => {
+    const database = openTestDatabase();
+    await database.prepare(`INSERT INTO sync_country_policies(
+      country_code,enabled,target_count,level1_limit,level2_limit,level3_limit,level4_limit,coverage_ratio,updated_at
+    ) VALUES ('CN',1,1000000000,0,0,0,0,0,'2026-08-02T00:00:00Z')`).run();
+    await database.prepare(`INSERT INTO sync_country_state(country_code,address_count,updated_at)
+      VALUES ('CN',?,'2026-08-02T00:00:00Z')`).bind(CHINA_PRIORITY_TARGET).run();
+    await database.prepare(`INSERT INTO sync_country_runtime(country_code,goal_state,execution_state,updated_at)
+      VALUES ('CN','incomplete','below_target','2026-08-02T00:00:00Z')`).run();
+    const sources = createQueueSources({ addressDatabase: database });
+    await expect(sources.chinaPriority(new Date('2026-08-02T10:00:00Z'))).resolves.toMatchObject({ blocksQueue: false });
+    await database.prepare("UPDATE sync_country_state SET address_count=? WHERE country_code='CN'").bind(CHINA_PRIORITY_TARGET - 1).run();
+    await expect(sources.chinaPriority(new Date('2026-08-02T10:00:00Z'))).resolves.toMatchObject({ blocksQueue: true });
     database.close();
   });
 });
@@ -1790,6 +1913,15 @@ describe('queue state store', () => {
     await reloaded.apply('NG', { action: 'requeue' }, '2026-08-02T01:00:00Z');
     expect((await store.load()).countries.NG).toBeUndefined();
   });
+
+  it('fails closed instead of treating a corrupt queue state file as empty', async () => {
+    const directory = stateDir();
+    await mkdir(directory, { recursive: true });
+    const file = resolve(directory, 'queue-state.json');
+    await writeFile(file, '{"schemaVersion":1,');
+    await expect(new QueueStateStore(file).load()).rejects.toMatchObject({ code: 'QUEUE_STATE_INVALID' });
+    expect(await readFile(file, 'utf8')).toBe('{"schemaVersion":1,');
+  });
 });
 
 describe('queue API endpoint', () => {
@@ -1825,21 +1957,19 @@ describe('queue API endpoint', () => {
 });
 
 describe('queue admin surface structure', () => {
-  const adminSource = readFileSync('src/components/SyncAdmin.tsx', 'utf8');
+  const adminSource = ['src/components/SyncAdmin.tsx', ...readdirSync('src/components/admin').map((file) => `src/components/admin/${file}`)]
+    .map((file) => readFileSync(file, 'utf8')).join('\n');
   const adminApiSource = readFileSync('server/control/admin-api.ts', 'utf8');
-  it('renders the queue as an independent view with 10s polling', () => {
-    expect(adminSource).toContain('sync-queue-panel');
+  it('merges the queue into the country workspace with visibility-aware polling', () => {
+    expect(adminSource).toContain('export function CountryWorkspace');
     expect(adminSource).toContain("request<SyncQueueData>('/sync/queue'");
     expect(adminSource).toContain('queue-row');
-    expect(adminSource).toContain("syncQueue: '/sync/queue'");
-    expect(adminSource).toContain("if (view === 'syncQueue')");
-    const addressDataBranch = adminSource.slice(adminSource.indexOf("if (view === 'addressData')"), adminSource.indexOf("if (view === 'syncQueue')"));
-    expect(addressDataBranch).not.toContain('<SyncQueuePanel');
+    expect(adminSource).toContain("if (value === 'syncQueue') return 'addressData';");
+    expect(adminSource).not.toContain("if (view === 'syncQueue')");
+    expect(adminSource).not.toContain('SyncQueuePanel');
     expect(adminSource).toContain("queueTitle: '同步队列'");
     expect(adminSource).toContain("queueTitle: 'Sync queue'");
-    expect(adminSource).toContain('const visible = [...entries].sort');
-    expect(adminSource).not.toContain('queueExecutionStates');
-    expect(adminSource).toContain("reason.startsWith('missing_api_key:')");
+    expect(adminSource).toContain("if (code === 'missing_api_key')");
     expect(adminSource).toContain("total: '国家总量'");
     expect(adminSource).toContain("coverage: '行政区覆盖'");
     expect(adminSource).toContain("minimums: '层级/节点最低数量'");
@@ -1847,12 +1977,14 @@ describe('queue admin surface structure', () => {
     expect(adminSource).toContain('rules.regionalMinimums');
     expect(adminSource).toContain("'administrative_coverage'");
     expect(adminSource).toContain("'regional_minimums'");
+    expect(adminSource).toContain('ui.queueStale');
     expect(adminSource.match(/queueTitle:/gu)).toHaveLength(10);
     expect(adminSource.match(/queueResetIn:/gu)).toHaveLength(10);
   });
-  it('proxies the queue through the admin API with the CN worker row merged', () => {
+  it('reads the published queue snapshot from the database with the CN worker row merged', () => {
     expect(adminApiSource).toContain("app.get('/admin/api/sync/queue'");
-    expect(adminApiSource).toContain("new URL('/api/v1/sync/queue', process.env.SYNC_CONTROL_URL || 'http://127.0.0.1:8791')");
+    expect(adminApiSource).toContain('SELECT queue_snapshot_json,queue_snapshot_at FROM sync_scheduler_state');
+    expect(adminApiSource).toContain('if (!row?.queue_snapshot_json) return fetchSyncQueueUpstream();');
     expect(adminApiSource).toContain("engine: 'china-worker'");
     expect(adminApiSource).toContain('rules: goal.rules');
     expect(adminApiSource).toContain('rules: countryGoal.rules');

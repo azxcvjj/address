@@ -37,6 +37,15 @@ describe('production blue-green deployment', () => {
     }
     expect(deployClient).not.toContain('init-compose.sh');
   });
+
+  it('loads provider authorization settings into the production sync singleton', () => {
+    const start = overlay.indexOf('  sync:');
+    const remainder = overlay.slice(start + 3);
+    const relativeEnd = remainder.search(/\n  [a-z][a-z-]*:/u);
+    const block = overlay.slice(start, relativeEnd < 0 ? undefined : start + 3 + relativeEnd);
+    expect(block).toMatch(/env_file:\s*\n\s+- \.\/config\/address\.env/u);
+  });
+
   it('keeps the isolated verification stack in a separate Compose project', () => {
     expect(isolatedOverlay).toMatch(/^name: address-test$/mu);
   });
@@ -70,8 +79,9 @@ describe('production blue-green deployment', () => {
 
   it('serializes activations and never retries a partially completed cutover', () => {
     expect(deploy).toContain('flock -n 9');
-    expect(deployClient).toContain('ssh_once "cd \'$ADDRESS_ROOT\' && bash ./ops/activate-production-release.sh');
-    expect(deployClient).not.toContain('ssh_retry "cd \'$ADDRESS_ROOT\' && bash ./ops/activate-production-release.sh');
+    expect(deployClient).toContain('ssh_once "cd \'$ADDRESS_ROOT\' && rm -f \'$LOG\' \'$LOG.exit\' && setsid nohup sh -c \'bash ./ops/activate-production-release.sh');
+    expect(deployClient).not.toMatch(/ssh_retry "[^"]*activate-production-release\.sh/u);
+    expect(deployClient).toContain('activation failed with status');
   });
 
   it('uses non-interactive public-key SSH with connection keepalives', () => {
@@ -99,6 +109,17 @@ describe('production blue-green deployment', () => {
     expect(deploy).toContain('compose up -d --no-deps --wait --wait-timeout 6000 sync');
   });
 
+  it('allows bounded production initialization without replacing the real sync readiness check', () => {
+    const sync = overlay.slice(overlay.indexOf('\n  sync:'), overlay.indexOf('\nsecrets:'));
+    expect(sync).toMatch(/healthcheck:\s*\n\s+start_period: 10m/u);
+    expect(sync).not.toMatch(/\b(?:test|disable|retries|interval|timeout):/u);
+    const baseSync = compose.slice(compose.indexOf('\n  sync:'), compose.indexOf('\nsecrets:'));
+    expect(baseSync).toContain("fetch('http://127.0.0.1:8791/healthz')");
+    expect(baseSync).toContain('interval: 15s');
+    expect(baseSync).toContain('timeout: 5s');
+    expect(baseSync).toContain('retries: 8');
+  });
+
   it('uses an internal sync alias that cannot collide with the isolated stack on shared egress', () => {
     expect(compose).toMatch(/sync:[\s\S]*?aliases:\s*\n\s*- address-sync-control/u);
     expect(compose).toContain('SYNC_CONTROL_URL: http://address-sync-control:8791');
@@ -120,5 +141,21 @@ describe('production blue-green deployment', () => {
     expect(deploy).toContain('ADDRESS_RELEASE_RETENTION');
     expect(deploy).toContain('[[ "$protected" == *" $release "* ]]');
     expect(deploy).toContain('! -L "$target"');
+  });
+
+  it('stops the sync service without waiting for long startup consistency queries', () => {
+    const sync = readFileSync('server/sync/index.mjs', 'utf8');
+    expect(sync).toContain('(closing ? Promise.resolve() : task())');
+    expect(sync.indexOf('closing = true;')).toBeLessThan(sync.indexOf('await coordinator.cancelActive();'));
+    expect(sync).toContain('Promise.race([postgresPool.end(), new Promise((done) => setTimeout(done, POOL_CLOSE_GRACE_MS).unref())])');
+    expect(sync).toMatch(/await runtime\.close\(\);\s*process\.exit\(0\);/u);
+  });
+
+  it('removes images of pruned releases and stale build cache after a successful deployment', () => {
+    const cleanup = deploy.slice(deploy.indexOf('cleanup_release_artifacts() {'), deploy.indexOf('verify_slot() {'));
+    expect(cleanup).toContain('kept+="$(basename "$target") "');
+    expect(cleanup).toContain('! grep -qxF "$image" <<<"$used"');
+    expect(cleanup).toContain('docker image rm "$image"');
+    expect(cleanup).toContain('docker builder prune -f --filter until=24h');
   });
 });

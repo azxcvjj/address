@@ -11,10 +11,19 @@ import { runAddressSync, syncPostgresStatementTimeout } from './run-address-sync
 import { startDailyScheduler } from './scheduler.mjs';
 import { createSourceAdapters, loadSourceCatalog } from './source-adapters.mjs';
 import { ensureAddressPolicies } from './address-policy.mjs';
-import { validatePublishedPoolBatch } from '../database/published-pool.mjs';
+import { reconcilePublishedPoolProjections, validatePublishedPoolBatch } from '../database/published-pool.mjs';
+import { refreshStaleAddressGenerationIndexes } from '../database/generation-index.mjs';
+import { refreshIndexedResidentialCoverage } from '../database/residential-coverage.mjs';
+import { refreshAddressCoverage } from '../control/coverage';
+import { runPostcodeInference } from './postcode-inference.mjs';
+import { repairChineseAddressStrings } from './chinese-address-repair.mjs';
+import { repairTaiwanOfficialNames } from './taiwan-name-repair.mjs';
+import { ensureEvidenceDatasetIndex } from '../database/evidence-dataset-index.mjs';
 import { masterKeyFrom } from '../control/security';
 import { ControlStore } from '../control/store';
 import { ChinaDataService } from '../china/service';
+
+const POOL_CLOSE_GRACE_MS = 10_000;
 
 const integer = (value, fallback, minimum, maximum) => {
   const number = value === undefined || value === '' ? fallback : Number.parseInt(value, 10);
@@ -29,14 +38,19 @@ const ensureChinaTargets = async (database, environment, postgresUrl) => {
   if (String(environment.NODE_ENV || '').toLowerCase() === 'test'
     || !String(environment.CONFIG_MASTER_KEY || '').trim()) return;
   const count = Number(await database.prepare('SELECT COUNT(*) AS total FROM cn_sync_targets').first('total') || 0);
-  if (count > 0) return;
   const control = new ControlStore(database, masterKeyFrom(environment.CONFIG_MASTER_KEY));
   const china = new ChinaDataService(database, control, resolve(environment.ADDRESS_DATA_ROOT || 'data'), {
     postgresUrl,
     masterKey: masterKeyFrom(environment.CONFIG_MASTER_KEY)
   });
-  await china.initializeTargets({ scheduleContinuation: false });
-  await china.close();
+  if (count === 0) {
+    await china.initializeTargets({ scheduleContinuation: false });
+    await china.close();
+    return;
+  }
+  void china.replayRecoverableCandidates()
+    .catch((error) => console.error('[china-sync] candidate replay failed', error))
+    .finally(() => china.close());
 };
 
 export const createPublicationValidationWorker = ({
@@ -110,6 +124,48 @@ export const createSyncRuntime = async ({
   const database = providedDatabase || new PostgresDatabase(postgresPool);
   const queueDatabase = providedDatabase || new PostgresDatabase(postgresPool);
   await ensureAddressPolicies(database);
+  // A full projection check scans every published address; it must not delay the health endpoint.
+  // Each startup step is independent: one timeout must not skip the others.
+  let closing = false;
+  // Startup checks stop at the next step once the service is closing instead of holding database connections.
+  const startupStep = (name, task) => (closing ? Promise.resolve() : task()).catch((error) => {
+    console.error(`[address-sync] startup ${name} failed`, error?.code || error?.message || error);
+  });
+  const startupReconciliation = (async () => {
+    if (environment.NODE_ENV === 'test') {
+      await startupStep('projection reconciliation', () => reconcilePublishedPoolProjections(database));
+      return;
+    }
+    // Runs beside the other startup steps: a concurrent build waits for running import transactions.
+    if (postgresPool) void startupStep('evidence dataset index', async () => {
+      const client = await postgresPool.connect();
+      try { await ensureEvidenceDatasetIndex(client); } finally { client.release(); }
+    });
+    await startupStep('postcode inference', async () => {
+      const countries = (await database.prepare("SELECT country_code FROM sync_country_policies WHERE enabled=1 AND country_code<>'CN' ORDER BY country_code").all()).results;
+      for (const { country_code: countryCode } of countries) {
+        const summary = await runPostcodeInference({ database, countryCode, cacheDir: environment.ADDRESS_SYNC_CACHE_DIR || resolve('.data-cache'),
+          pythonBin: environment.PYTHON_BIN }).catch((error) => ({ countryCode, error: error?.message || String(error) }));
+        if (summary.checked || summary.error) console.log(JSON.stringify({ event: 'postcode_inference', ...summary }));
+      }
+    });
+    await startupStep('chinese address spacing', async () => {
+      const countries = (await database.prepare("SELECT country_code FROM sync_country_policies WHERE enabled=1 AND country_code<>'CN' ORDER BY country_code").all()).results;
+      for (const { country_code: countryCode } of countries) {
+        const summary = await repairChineseAddressStrings({ database, countryCode });
+        if (summary.repaired) console.log(JSON.stringify({ event: 'chinese_address_repair', ...summary }));
+      }
+    });
+    await startupStep('taiwan official names', async () => {
+      const summary = await repairTaiwanOfficialNames({ database });
+      if (summary.renamed || summary.duplicates) console.log(JSON.stringify({ event: 'taiwan_official_name_repair', ...summary }));
+    });
+    await startupStep('projection reconciliation', () => reconcilePublishedPoolProjections(database));
+    await startupStep('generation index refresh', () => refreshStaleAddressGenerationIndexes(database));
+    await startupStep('residential coverage', () => refreshIndexedResidentialCoverage(database, undefined, { skipLocked: true }));
+    await startupStep('address coverage', () => refreshAddressCoverage(database, { useGenerationIndex: true }));
+    console.log(JSON.stringify({ event: 'startup_coverage_ready', at: new Date().toISOString() }));
+  })();
   await ensureChinaTargets(database, environment, environment.POSTGRES_URL || environment.DATABASE_URL || '');
   const scheduleStateFile = resolve(stateDir, 'daily-schedule.json');
   let catalogPromise;
@@ -126,12 +182,13 @@ export const createSyncRuntime = async ({
   };
   const history = new SyncHistoryStore(queueDatabase, { catalogShards, now });
   await history.repairInterruptedRuns();
+  await history.repairFailedRunGrowth();
   await history.repairLegacyProjections();
   const coordinator = new SyncCoordinator({
     stateDir,
     now,
     history,
-    jobTimeoutMs: integer(environment.SYNC_JOB_TIMEOUT_MS, 90 * 60_000, 60_000, 24 * 60 * 60_000),
+    jobTimeoutMs: integer(environment.SYNC_JOB_TIMEOUT_MS, 150 * 60_000, 60_000, 24 * 60 * 60_000),
     cancelGraceMs: integer(environment.SYNC_CANCEL_GRACE_MS, 30_000, 5_000, 10 * 60_000),
     runSync: ({ id, trigger, shards, signal, onProgress }) => runSync({
       releaseId: id,
@@ -189,6 +246,7 @@ export const createSyncRuntime = async ({
   let stopScheduler;
   let stopQueue;
   return {
+    startupReconciliation,
     api,
     database,
     coordinator,
@@ -217,15 +275,19 @@ export const createSyncRuntime = async ({
       };
     },
     close: async () => {
+      closing = true;
       stopScheduler?.();
       stopScheduler = undefined;
       stopQueue = undefined;
       await artifactCleanup?.stop();
-      await queue.stop();
-      await coordinator.waitForIdle();
+      const queueStop = queue.stop();
+      await coordinator.cancelActive();
+      await queueStop;
       await publicationValidationWorker.stop();
       testDatabase?.close();
-      await postgresPool?.end();
+      // A long consistency query still holding a client must not keep the service from stopping; the process exit
+      // closes that connection and PostgreSQL rolls back its work.
+      if (postgresPool) await Promise.race([postgresPool.end(), new Promise((done) => setTimeout(done, POOL_CLOSE_GRACE_MS).unref())]);
     }
   };
 };
@@ -267,8 +329,8 @@ if (invokedDirectly) {
     }
   });
   server.listen(port, host, () => console.log(`Address sync control listening on http://${host}:${port}`));
-  let stopBackfill = () => {};
-  if (/^(1|true|yes)$/iu.test(String(process.env.TRANSLATION_BACKFILL_ENABLED || ''))) {
+  let stopBackfill = async () => {};
+  if (!/^(0|false|no)$/iu.test(String(process.env.TRANSLATION_BACKFILL_ENABLED || ''))) {
     const { startTranslationBackfill } = await import('./translation-backfill.mjs');
     stopBackfill = startTranslationBackfill({
       database: runtime.database,
@@ -277,9 +339,15 @@ if (invokedDirectly) {
     console.log('Translation backfill worker enabled');
   }
   const shutdown = async () => {
-    stopBackfill();
-    await new Promise((done) => server.close(done));
-    await runtime.close();
+    try {
+      await stopBackfill();
+      await new Promise((done) => server.close(done));
+      await runtime.close();
+      process.exit(0);
+    } catch (error) {
+      console.error('[address-sync] shutdown failed', error);
+      process.exit(1);
+    }
   };
   process.once('SIGINT', () => void shutdown());
   process.once('SIGTERM', () => void shutdown());

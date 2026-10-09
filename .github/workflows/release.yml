@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version, for example v2.0.6
+        description: Release version, for example v2.0.9
         required: true
-        default: v2.0.6
+        default: v2.0.9
 
 permissions:
   contents: read
@@ -60,6 +60,8 @@ jobs:
             version="${GITHUB_REF_NAME}"
           fi
           [[ "$version" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]
+          package_version=$(node -p "require('./package.json').version")
+          [[ "$version" == "v$package_version" ]]
           echo "value=$version" >> "$GITHUB_OUTPUT"
       - name: Reject duplicate release
         shell: bash
@@ -112,19 +114,28 @@ jobs:
         run: |
           version='${{ steps.version.outputs.value }}'
           cat > release/RELEASE_NOTES.md <<'NOTES'
-          ### Deployment
-          - Added a single-file Docker Compose deployment: download `docker-compose.yml` and run `docker compose up -d` without cloning the repository or running an initialization script.
-          - Added an idempotent bootstrap service that generates and persists PostgreSQL, encryption, synchronization, and broker secrets.
-          - Preserved existing `config/secrets` installations and hardened the production Compose overlay so PostgreSQL and legacy secrets are not recreated during blue-green upgrades.
+          ### Administrator console
+          - Redesigned the console with a grouped sidebar, collapsible navigation, a light glass theme, local country flags, and in-app confirmation dialogs.
+          - Replaced the separate sync queue with an address data workspace: status filters, search, sorting, completion-rule badges, and per-country detail tabs for overview, targets, nodes, sources, and history.
+          - The overview and country list now show administrative coverage (nodes with addresses) separately from nodes that meet the per-node minimum, matching the completion rules.
+          - Added a system status endpoint, visibility-aware polling, and login rate limiting.
 
-          ### Access and security
-          - Set the first-run administrator password to `admin`, disabled the frontend password by default, and require the default administrator password to be changed before other administrator features are available.
-          - Added optional first-run administrator and frontend password settings directly in `docker-compose.yml`.
-          - Added validated multi-origin CORS support while retaining backward compatibility with the previous single-origin setting.
+          ### OpenAI-compatible translation
+          - Accepts a base URL prefix or the full `/chat/completions` URL, previews the actual request URL, and detects the API version on save.
+          - New providers start with the built-in default prompt, which can be restored in one click.
+          - Added a step-by-step test console that shows the request URL, model, parameters, HTTP status, latency, token usage, model reply, and the provider's error message with keys masked.
+          - Credentials marked for review can be tested again and return to service when a test passes; malformed model replies no longer mark a credential for review.
+          - Reasoning models get a 120-second deadline that includes broker queueing, so slow but healthy providers are no longer cancelled at 30 seconds.
+          - Added an unlimited quota option, which is the default for new OpenAI-compatible credentials.
+
+          ### Synchronization and deployment
+          - The sync service publishes its queue snapshot to PostgreSQL, so the console stays responsive while synchronization is busy.
+          - Migration retries residential coverage lock timeouts with bounded backoff instead of failing the deployment.
+          - The live contract audit accepts the official Hong Kong place-name character 涌.
 
           ### Documentation and verification
-          - Updated the English, Simplified Chinese, and Traditional Chinese README, API, deployment, backup, and restore instructions for the one-file deployment flow.
-          - Added bootstrap persistence, legacy-secret conflict, forced-password-change, multi-origin, and production deployment regression coverage.
+          - Rewrote the README, deployment, API, API key, and development guides in English, Simplified Chinese, and Traditional Chinese, with Docker Compose first and new screenshots.
+          - Verified 1,420 JavaScript/TypeScript tests, 109 Python tests, type checks, builds, administrator and UI end-to-end tests, and 500 live address-contract samples for each of the 27 supported countries.
           NOTES
       - name: Publish stable GitHub release
         shell: bash

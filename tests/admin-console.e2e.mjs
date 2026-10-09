@@ -142,11 +142,12 @@ try {
   await login(loginPage, 'initial admin password', failedResponses);
 
   const page = await context.newPage();
+  const acceptConfirm = async () => { const dialog = page.getByRole('dialog', { name: '请确认', exact: true }); await dialog.waitFor(); await dialog.getByRole('button', { name: '确认', exact: true }).click(); await dialog.waitFor({ state: 'detached' }); };
   await page.goto(`${baseUrl}/admin/`);
   await page.locator('.dashboard-page').waitFor();
   assert.equal(await page.locator('.admin-content > header.admin-topbar').count(), 1);
   assert.equal(await page.locator('.admin-content > header.admin-topbar h1').count(), 1);
-  assert.equal(await page.locator('.admin-sidebar .nav-icon').count(), 9);
+  assert.equal(await page.locator('.admin-sidebar .nav-icon').count(), 8);
   assert.equal(await page.locator('.dashboard-kpis .dashboard-kpi').count(), 4);
   assert.equal(await page.locator('.world-distribution-map').count(), 1);
   const mapCanvas = page.locator('.world-distribution-map .maplibregl-canvas').first();
@@ -188,7 +189,7 @@ try {
   assert.equal(await page.locator('.dashboard-ranking').count(), 0);
   assert.equal(await page.locator('.country-data-table').count(), 1);
   assert.equal(await page.locator('.admin-sidebar-status').count(), 1);
-  assert.equal(await page.getByText('管理员', { exact: true }).count(), 1);
+  assert.equal(await page.getByText('管理员', { exact: true }).count(), 0);
   assert.equal(await page.getByText('超级管理员', { exact: true }).count(), 0);
   assert.equal(await page.getByRole('button', { name: 'Language', exact: true }).count(), 1);
   assert.equal(await page.getByText('数据与系统管理', { exact: true }).count(), 0);
@@ -201,13 +202,13 @@ try {
 
   const views = [
     ['仪表盘', null], ['地址黑名单', '地址黑名单'], ['访问与安全', '访问策略'], ['地图密钥', '地图密钥'],
-    ['地址数据', 'address-data'], ['同步队列', 'sync-queue'], ['快捷区域', 'shortcuts'], ['接口令牌', '接口令牌']
+    ['地址数据', 'address-data'], ['同步历史', 'sync-history'], ['快捷区域', 'shortcuts'], ['接口令牌', '接口令牌']
   ];
   for (let round = 0; round < 3; round += 1) {
     for (const [tab, title] of views) {
       await page.getByRole('button', { name: tab, exact: true }).click();
       if (title === 'address-data') await page.locator('.address-data-page').waitFor();
-      else if (title === 'sync-queue') await page.locator('.sync-queue-panel').waitFor();
+      else if (title === 'sync-history') await page.locator('.sync-history-panel').waitFor();
       else if (title === 'shortcuts') await page.locator('.shortcut-settings-page').waitFor();
       else if (title) await panel(page, title).waitFor();
       else await page.locator('.dashboard-page').waitFor();
@@ -338,13 +339,94 @@ try {
   await providerRow().getByRole('button', { name: '停用', exact: true }).waitFor();
 
   const translationPanel = page.locator('.admin-panel').filter({ has: page.getByRole('heading', { name: '在线翻译', exact: true }) });
+  await translationPanel.getByText(/有道按量收费.*项目限额不代表供应商免费额度/u).waitFor();
+  await translationPanel.getByText(/在线服务按下方配置的优先级执行.*可能限流或不可用/u).waitFor();
   assert.equal(await translationPanel.getByRole('switch', { name: '启用谷歌翻译', exact: true }).count(), 1);
   assert.equal(await translationPanel.locator('input[name=googleTranslationEnabled]').count(), 0);
-  await translationPanel.getByText('未配置', { exact: true }).waitFor();
+  await translationPanel.getByText('未配置', { exact: true }).first().waitFor();
   assert.equal(await translationPanel.getByRole('button', { name: '测试', exact: true }).count(), 0);
+  const originalViewport = page.viewportSize();
+  const translationConsoleErrors = [];
+  const onTranslationConsole = (message) => { if (message.type() === 'error') translationConsoleErrors.push(message.text()); };
+  page.on('console', onTranslationConsole);
+  for (const [, label, fee] of [
+    ['zh-CN', '简体中文', /有道按量收费.*项目限额不代表供应商免费额度/u],
+    ['en', 'English', /Youdao is usage-based.*not free-credit guarantees/u],
+    ['zh-TW', '繁體中文', /有道按量收費.*專案限額不代表供應商免費額度/u]
+  ]) {
+    await selectLocale(page, label);
+    for (const viewport of [{ width: 1440, height: 960 }, { width: 390, height: 844 }]) {
+      await page.setViewportSize(viewport);
+      const settings = page.locator('.translation-settings');
+      await settings.getByText(fee).waitFor();
+      await settings.getByText(/Cloud Translation/u).waitFor();
+      const addButton = settings.locator('.translation-provider:not(.deepl-provider):not(.openai-provider) .translation-provider-header button');
+      await addButton.click();
+      const dialog = page.getByRole('dialog');
+      await dialog.getByText(fee).waitFor();
+      assert.equal(await dialog.locator('input[name=youdaoAppKey]').inputValue(), '');
+      assert.equal(await dialog.locator('input[name=youdaoAppSecret]').getAttribute('type'), 'password');
+      const layout = await dialog.evaluate((element) => ({
+        overflowBeyondLayoutFloor: document.documentElement.scrollWidth > Math.max(window.innerWidth,
+          parseFloat(getComputedStyle(document.body).minWidth) || 0),
+        dialogOverflow: element.scrollWidth > element.clientWidth,
+        dialogOutsideViewport: element.getBoundingClientRect().left < 0 || element.getBoundingClientRect().right > window.innerWidth,
+        noteFontSize: parseFloat(getComputedStyle(element.querySelector('.translation-notice')).fontSize)
+      }));
+      assert.equal(layout.overflowBeyondLayoutFloor, false, JSON.stringify({ viewport, layout }));
+      assert.equal(layout.dialogOverflow, false);
+      assert.equal(layout.dialogOutsideViewport, false);
+      assert.ok(layout.noteFontSize >= 12);
+      await dialog.getByRole('button').last().focus();
+      await page.keyboard.press('Tab');
+      assert.equal(await dialog.getByRole('button').first().evaluate((element) => element === document.activeElement), true);
+      await page.keyboard.press('Escape');
+      await dialog.waitFor({ state: 'detached' });
+      assert.equal(await addButton.evaluate((element) => element === document.activeElement), true);
+      const addDeepL = settings.locator('.deepl-provider .translation-provider-header button');
+      await addDeepL.click();
+      const deeplDialog = page.getByRole('dialog');
+      await deeplDialog.getByText(/DeepL API Free/u).waitFor();
+      assert.equal(await deeplDialog.locator('input[name=secret]').inputValue(), '');
+      assert.equal(await deeplDialog.locator('input[name=secret]').getAttribute('type'), 'password');
+      assert.equal(await deeplDialog.locator('input[name=quotaLimit]').inputValue(), '500000');
+      await deeplDialog.locator('input[name=quotaLimit]').fill('1000000');
+      assert.equal(await deeplDialog.locator('select[name=quotaPeriod]').count(), 0);
+      assert.equal(await deeplDialog.evaluate((element) => element.scrollWidth > element.clientWidth), false);
+      await page.keyboard.press('Escape');
+      await deeplDialog.waitFor({ state: 'detached' });
+      assert.equal(await addDeepL.evaluate((element) => element === document.activeElement), true);
+      const addOpenAI = settings.locator('.openai-provider .translation-provider-header button');
+      await addOpenAI.click();
+      const openAIDialog = page.getByRole('dialog');
+      await openAIDialog.getByText(/OpenAI.*Chat Completions/u).waitFor();
+      assert.equal(await openAIDialog.locator('input[name=apiKey]').getAttribute('type'), 'password');
+      assert.equal(await openAIDialog.locator('input[name=baseUrl]').inputValue(), '');
+      assert.equal(await openAIDialog.locator('input[name=model]').inputValue(), '');
+      assert.equal(await openAIDialog.locator('input[name=reasoningEffort]').inputValue(), 'low');
+      assert.equal(await openAIDialog.locator('input[name=maxTokens]').inputValue(), '8192');
+      assert.equal(await openAIDialog.locator('input[name=translationPriority]').inputValue(), '10');
+      assert.equal(await openAIDialog.locator('textarea[name=translationPrompt]').count(), 1);
+      const openAILayout = await openAIDialog.evaluate((element) => ({
+        dialogOverflow: element.scrollWidth > element.clientWidth,
+        dialogOutsideViewport: element.getBoundingClientRect().left < 0 || element.getBoundingClientRect().right > window.innerWidth
+      }));
+      assert.equal(openAILayout.dialogOverflow, false);
+      assert.equal(openAILayout.dialogOutsideViewport, false);
+      await page.keyboard.press('Escape');
+      await openAIDialog.waitFor({ state: 'detached' });
+      assert.equal(await addOpenAI.evaluate((element) => element === document.activeElement), true);
+    }
+  }
+  page.off('console', onTranslationConsole);
+  assert.deepEqual(translationConsoleErrors, []);
+  console.log('translation cost warnings passed: 3 locales, desktop and mobile dialogs, keyboard, console and existing layout floor');
+  await page.setViewportSize(originalViewport);
+  await selectLocale(page, '简体中文');
   const createYoudao = async (label, appKey, appSecret) => {
     await translationPanel.getByRole('button', { name: '添加密钥', exact: true }).click();
     const dialog = page.getByRole('dialog', { name: '添加密钥', exact: true });
+    await dialog.getByText(/若不接受费用，请勿添加或启用凭据/u).waitFor();
     await dialog.locator('input[name=label]').fill(label);
     await dialog.locator('input[name=youdaoAppKey]').fill(appKey);
     await dialog.locator('input[name=youdaoAppSecret]').fill(appSecret);
@@ -409,8 +491,8 @@ try {
   await tokenRow.filter({ hasText: '读取' }).waitFor();
   assert.equal(await page.evaluate(async (value) => (await fetch('/api/v1/generate', { headers: { Authorization: `Bearer ${value}` } })).status, token), 401);
   assert.equal(await page.evaluate(async (value) => (await fetch('/api/v1/countries', { headers: { Authorization: `Bearer ${value}` } })).status, token), 200);
-  page.once('dialog', (dialog) => dialog.accept());
   await tokenRow.getByRole('button', { name: '撤销', exact: true }).click();
+  await acceptConfirm();
   assert.equal(await page.evaluate(async (value) => (await fetch('/api/v1/countries', { headers: { Authorization: `Bearer ${value}` } })).status, token), 401);
 
   const importStatus = await page.evaluate(async () => {
@@ -433,7 +515,9 @@ try {
   assert.equal(await page.locator('.world-distribution-map .maplibregl-canvas').count(), 1);
   assert.equal(await page.locator('.world-distribution-map img').count(), 0);
   await page.locator('.country-coverage-table img.country-flag').first().waitFor();
-  assert.match(await page.locator('.country-coverage-table img.country-flag').first().getAttribute('src'), /^https:\/\/flagcdn\.com\/24x18\/[a-z]{2}\.png$/u);
+  const flagSource = await page.locator('.country-coverage-table img.country-flag').first().getAttribute('src');
+  assert.match(flagSource, /^\/flags\/[a-z]{2}\.svg$/u);
+  assert.equal(await page.evaluate(async (src) => (await fetch(src)).status, flagSource), 200);
   await page.locator('.country-table-tools input').fill('美国');
   await drill('美国').waitFor();
   assert.equal(await page.locator('.country-coverage-table tbody tr').count(), 1);
@@ -452,73 +536,80 @@ try {
     const pathname = new URL(request.url()).pathname;
     if (pathname === '/admin/api/china/areas') areaRequests += 1;
   });
-  await page.getByRole('button', { name: '同步队列', exact: true }).click();
-  const queuePanel = page.locator('.sync-queue-panel');
-  await queuePanel.waitFor();
-  await queuePanel.locator('h2').filter({ hasText: '同步队列' }).waitFor();
-  try { await queuePanel.locator('tr.queue-row[data-country="CN"]').waitFor({ timeout: 20_000 }); }
-  catch (error) {
-    throw new Error(`ADMIN_QUEUE_FAILED:${await queuePanel.textContent()}:${failedResponses.join(',')}`, { cause: error });
-  }
-  assert.ok(await queuePanel.locator('tr.queue-row').count() >= 1);
-  assert.equal(await queuePanel.locator('tr.queue-row').first().getAttribute('data-country'), 'CN');
-  assert.equal(await queuePanel.locator('.queue-unavailable').count(), 0);
   await page.getByRole('button', { name: '地址数据', exact: true }).click();
   await page.locator('.address-data-page').waitFor();
   assert.equal(await page.locator('.sync-queue-panel').count(), 0);
-  const chinaRow = page.locator('.address-data-table tbody tr').filter({ has: page.getByText('中国', { exact: true }) });
-  try { await chinaRow.waitFor({ timeout: 20_000 }); }
+  try { await page.locator('.address-data-table tr.queue-row[data-country="CN"]').waitFor({ timeout: 20_000 }); }
   catch (error) {
     throw new Error(`ADMIN_ADDRESS_DATA_FAILED:${await page.locator('.address-data-page').textContent()}:${failedResponses.join(',')}`, { cause: error });
   }
+  assert.equal(await page.locator('.address-data-table tr.queue-row').first().getAttribute('data-country'), 'CN');
+  assert.equal(await page.locator('.queue-unavailable').count(), 0);
+  assert.ok(await page.locator('.address-data-table .badge.target-state').count() > 0);
+  assert.ok(await page.locator('.address-data-table .coverage-cell').count() > 0);
+  assert.equal(await page.locator('.segmented-filter button').count(), 6);
+  await page.locator('.workspace-toolbar input').fill('CN');
+  assert.equal(await page.locator('.address-data-table tbody tr').count(), 1);
+  await page.locator('.workspace-toolbar input').fill('');
+  const chinaRow = page.locator('.address-data-table tbody tr[data-country="CN"]');
   await chinaRow.getByRole('button', { name: '详情', exact: true }).click();
-  const addressDialog = page.getByRole('dialog', { name: /中国.*详情/u });
-  await addressDialog.getByText('区县覆盖', { exact: true }).waitFor();
+  const detail = page.locator('.country-detail');
+  await detail.getByRole('heading', { name: '中国', exact: true }).waitFor();
+  assert.equal(new URL(page.url()).searchParams.get('country'), 'CN');
+  assert.equal(await detail.getByRole('tab').count(), 6);
+  await detail.getByRole('tab', { name: '区县覆盖', exact: true }).click();
   assert.equal(await page.getByRole('button', { name: '开始/继续同步', exact: true }).count(), 0);
-  await addressDialog.locator('.coverage-filters select').nth(0).selectOption('110000');
-  await addressDialog.locator('.coverage-filters select').nth(1).selectOption('110100');
-  await addressDialog.locator('.coverage-filters select').nth(2).selectOption('110105');
-  await addressDialog.locator('tbody tr').filter({ hasText: '朝阳区' }).waitFor();
-  await addressDialog.getByText('第 1 / 1 页，共 1 条', { exact: true }).waitFor();
+  await detail.locator('.coverage-filters select').nth(0).selectOption('110000');
+  await detail.locator('.coverage-filters select').nth(1).selectOption('110100');
+  await detail.locator('.coverage-filters select').nth(2).selectOption('110105');
+  await detail.locator('tbody tr').filter({ hasText: '朝阳区' }).waitFor();
+  await detail.getByText('第 1 / 1 页，共 1 条', { exact: true }).waitFor();
   const settledAreaRequests = areaRequests;
   await page.waitForTimeout(3200);
   assert.equal(areaRequests, settledAreaRequests);
   assert.equal(await page.evaluate(async () => (await fetch('/admin/api/china/areas?provinceAdcode=invalid')).status), 400);
 
-  assert.ok(await page.locator('.address-data-table .badge.target-state').count() > 0);
-  assert.ok(await page.locator('.address-data-table .coverage-cell').count() > 0);
-
-  await addressDialog.getByRole('button', { name: '加载节点目标', exact: true }).click();
-  const nodeTable = addressDialog.locator('.node-target-table');
+  await detail.getByRole('tab', { name: '节点目标', exact: true }).click();
+  await detail.getByRole('button', { name: '加载节点目标', exact: true }).click();
+  const nodeTable = detail.locator('.node-target-table');
   const beijingNodeRow = nodeTable.locator('tbody tr').filter({ hasText: '北京市' }).first();
   await beijingNodeRow.waitFor();
   await beijingNodeRow.getByRole('button', { name: '编辑', exact: true }).click();
   await beijingNodeRow.locator('input').fill('8');
   await beijingNodeRow.getByRole('button', { name: '保存', exact: true }).click();
-  await addressDialog.locator('.node-panel-notice').filter({ hasText: '节点目标已保存' }).waitFor();
+  await detail.locator('.node-panel-notice').filter({ hasText: '节点目标已保存' }).waitFor();
   await beijingNodeRow.locator('.target-source-tag.override').waitFor();
   await beijingNodeRow.getByText('8', { exact: true }).waitFor();
   await beijingNodeRow.getByRole('button', { name: '恢复默认', exact: true }).click();
-  await addressDialog.locator('.node-panel-notice').filter({ hasText: '已恢复默认目标' }).waitFor();
+  await detail.locator('.node-panel-notice').filter({ hasText: '已恢复默认目标' }).waitFor();
   await beijingNodeRow.locator('.target-source-tag.default').waitFor();
   await beijingNodeRow.getByText('800', { exact: true }).waitFor();
 
-  await addressDialog.locator('input[name=minPerNode]').fill('6');
-  await addressDialog.locator('input[name=coveragePercent]').fill('90');
-  await addressDialog.getByRole('button', { name: '保存设置', exact: true }).click();
+  await detail.getByRole('tab', { name: '目标设置', exact: true }).click();
+  await detail.locator('input[name=minPerNode]').fill('6');
+  await detail.locator('input[name=coveragePercent]').fill('90');
+  await detail.getByRole('button', { name: '保存设置', exact: true }).click();
   await page.locator('.admin-notice').filter({ hasText: '国家数据设置已保存' }).waitFor();
+  await detail.getByRole('tab', { name: '同步历史', exact: true }).click();
+  await detail.locator('.sync-history-panel').waitFor();
+  assert.equal(await detail.locator('.sync-history-toolbar').count(), 0);
+  await detail.getByRole('button', { name: '返回列表', exact: true }).click();
+  await page.locator('.address-data-table').waitFor();
+  assert.equal(new URL(page.url()).searchParams.get('country'), null);
   await chinaRow.getByRole('button', { name: '详情', exact: true }).click();
-  await addressDialog.locator('input[name=minPerNode]').waitFor();
-  assert.equal(await addressDialog.locator('input[name=minPerNode]').inputValue(), '6');
-  assert.equal(await addressDialog.locator('input[name=coveragePercent]').inputValue(), '90');
-  await addressDialog.getByRole('button', { name: '关闭', exact: true }).click();
+  await detail.getByRole('tab', { name: '目标设置', exact: true }).click();
+  await detail.locator('input[name=minPerNode]').waitFor();
+  assert.equal(await detail.locator('input[name=minPerNode]').inputValue(), '6');
+  assert.equal(await detail.locator('input[name=coveragePercent]').inputValue(), '90');
+  await page.goBack();
+  await page.locator('.address-data-table').waitFor();
 
   await page.getByRole('button', { name: '地图密钥', exact: true }).click();
-  page.once('dialog', (dialog) => dialog.accept());
   await providerRow().getByRole('button', { name: '删除', exact: true }).click();
+  await acceptConfirm();
   await providerRow().waitFor({ state: 'detached' });
-  page.once('dialog', (dialog) => dialog.accept());
   await browserRow.getByRole('button', { name: '删除', exact: true }).click();
+  await acceptConfirm();
   await page.getByText('尚未配置高德前端地图凭据', { exact: true }).waitFor();
 
   await page.getByRole('button', { name: '访问与安全', exact: true }).click();
